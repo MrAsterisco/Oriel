@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -34,8 +35,11 @@ nonisolated protocol FileOperationRepository: Sendable {
     saveAsCopy: Bool,
     in rootFolder: Folder
   ) async throws -> URL
+  func rotatePictureClockwise(_ item: MediaItem, in rootFolder: Folder) async throws -> URL
   func moveToTrash(_ target: FileOperationTarget, in rootFolder: Folder) async throws
   func delete(_ target: FileOperationTarget, in rootFolder: Folder) async throws
+  func imageQuality(for item: MediaItem, in rootFolder: Folder) async throws
+    -> DuplicateImageQuality
   func info(for target: FileOperationTarget, in rootFolder: Folder) async throws -> FileItemInfo
   func reveal(_ target: FileOperationTarget, in rootFolder: Folder) async throws
 
@@ -50,6 +54,20 @@ nonisolated protocol FileOperationRepository: Sendable {
       in rootFolder: Folder
     ) async throws
   #endif
+}
+
+extension FileOperationRepository {
+  func imageQuality(for item: MediaItem, in rootFolder: Folder) async throws
+    -> DuplicateImageQuality
+  {
+    let info = try await info(for: .media(item), in: rootFolder)
+    guard let width = info.pixelWidth, let height = info.pixelHeight else {
+      throw FileOperationRepositoryError.invalidTarget
+    }
+    return DuplicateImageQuality(
+      pixelCount: Int64(width) * Int64(height), bitDepth: 8,
+      isLossless: false, fileSize: info.fileSize ?? 0)
+  }
 }
 
 nonisolated enum FileOperationRepositoryError: LocalizedError, Sendable {
@@ -427,6 +445,136 @@ actor LocalFileOperationRepository: FileOperationRepository {
     }
   }
 
+  func rotatePictureClockwise(_ item: MediaItem, in rootFolder: Folder) async throws -> URL {
+    try await Self.performFileIO {
+      let target = FileOperationTarget.media(item)
+      let sourceURL = try Self.validatedMutableURL(for: target, in: rootFolder)
+      guard item.kind == .picture else { throw FileOperationRepositoryError.invalidTarget }
+      guard
+        let source = CGImageSourceCreateWithURL(
+          sourceURL as CFURL,
+          [kCGImageSourceShouldCache: false] as CFDictionary
+        ),
+        let sourceType = CGImageSourceGetType(source),
+        let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+          as? [CFString: Any]
+      else {
+        throw FileOperationRepositoryError.unsupportedOperation("This picture couldn’t be read.")
+      }
+      guard CGImageSourceGetCount(source) == 1 else {
+        throw FileOperationRepositoryError.unsupportedOperation(
+          "Multi-frame pictures can’t be rotated yet."
+        )
+      }
+
+      let orientation = (sourceProperties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+      guard (1...8).contains(orientation) else {
+        throw FileOperationRepositoryError.unsupportedOperation(
+          "This picture’s orientation is invalid."
+        )
+      }
+      let clockwiseOrientation = [6, 7, 8, 5, 2, 3, 4, 1][orientation - 1]
+      let sourceTypeIsWritable = Set(
+        CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
+      ).contains(sourceType as String)
+
+      if sourceTypeIsWritable {
+        let metadataURL = sourceURL.deletingLastPathComponent().appending(
+          path: ".oriel-rotate-metadata-\(UUID().uuidString).\(sourceURL.pathExtension)",
+          directoryHint: .notDirectory
+        )
+        defer { try? FileManager.default.removeItem(at: metadataURL) }
+
+        if let destination = CGImageDestinationCreateWithURL(
+          metadataURL as CFURL,
+          sourceType,
+          1,
+          nil
+        ),
+          CGImageDestinationCopyImageSource(
+            destination,
+            source,
+            [kCGImageDestinationOrientation: clockwiseOrientation] as CFDictionary,
+            nil
+          ),
+          let updatedSource = CGImageSourceCreateWithURL(metadataURL as CFURL, nil),
+          let updatedProperties = CGImageSourceCopyPropertiesAtIndex(updatedSource, 0, nil)
+            as? [CFString: Any],
+          (updatedProperties[kCGImagePropertyOrientation] as? NSNumber)?.intValue
+            == clockwiseOrientation
+        {
+          _ = try FileManager.default.replaceItemAt(sourceURL, withItemAt: metadataURL)
+          return sourceURL
+        }
+      }
+
+      let rawWidth = (sourceProperties[kCGImagePropertyPixelWidth] as? Int) ?? 0
+      let rawHeight = (sourceProperties[kCGImagePropertyPixelHeight] as? Int) ?? 0
+      guard rawWidth > 0, rawHeight > 0 else {
+        throw FileOperationRepositoryError.unsupportedOperation("This picture couldn’t be read.")
+      }
+      let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: max(rawWidth, rawHeight),
+      ]
+      guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+      else {
+        throw FileOperationRepositoryError.unsupportedOperation("This picture couldn’t be read.")
+      }
+      let rotated = CIImage(cgImage: image).oriented(.right)
+      guard let rotatedImage = CIContext().createCGImage(rotated, from: rotated.extent) else {
+        throw FileOperationRepositoryError.unsupportedOperation("The picture couldn’t be rotated.")
+      }
+
+      let destinationType = sourceTypeIsWritable ? sourceType : UTType.png.identifier as CFString
+      let outputURL =
+        sourceTypeIsWritable
+        ? sourceURL
+        : sourceURL.deletingPathExtension().appendingPathExtension("png")
+      let temporaryURL = sourceURL.deletingLastPathComponent().appending(
+        path: ".oriel-rotate-\(UUID().uuidString).\(outputURL.pathExtension)",
+        directoryHint: .notDirectory
+      )
+      defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+      guard
+        let destination = CGImageDestinationCreateWithURL(
+          temporaryURL as CFURL,
+          destinationType,
+          1,
+          nil
+        )
+      else {
+        throw FileOperationRepositoryError.unsupportedOperation("The picture couldn’t be saved.")
+      }
+      var properties = sourceProperties
+      properties[kCGImagePropertyOrientation] = 1
+      properties[kCGImagePropertyPixelWidth] = rotatedImage.width
+      properties[kCGImagePropertyPixelHeight] = rotatedImage.height
+      CGImageDestinationAddImage(destination, rotatedImage, properties as CFDictionary)
+      guard CGImageDestinationFinalize(destination) else {
+        throw FileOperationRepositoryError.unsupportedOperation("The picture couldn’t be saved.")
+      }
+
+      if outputURL.standardizedFileURL == sourceURL.standardizedFileURL {
+        _ = try FileManager.default.replaceItemAt(sourceURL, withItemAt: temporaryURL)
+        return sourceURL
+      }
+
+      try Self.requireAvailable(outputURL)
+      try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
+      do {
+        try FileManager.default.removeItem(at: sourceURL)
+      } catch {
+        try? FileManager.default.removeItem(at: outputURL)
+        throw error
+      }
+      return outputURL
+    }
+  }
+
   func moveToTrash(_ target: FileOperationTarget, in rootFolder: Folder) async throws {
     #if os(macOS)
       try await Self.performFileIO {
@@ -445,6 +593,30 @@ actor LocalFileOperationRepository: FileOperationRepository {
       try FileManager.default.removeItem(
         at: try Self.validatedMutableURL(for: target, in: rootFolder)
       )
+    }
+  }
+
+  func imageQuality(for item: MediaItem, in rootFolder: Folder) async throws
+    -> DuplicateImageQuality
+  {
+    try await Self.performFileIO {
+      let url = try Self.validatedURL(for: .media(item), in: rootFolder)
+      guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+        let width = properties[kCGImagePropertyPixelWidth] as? Int,
+        let height = properties[kCGImagePropertyPixelHeight] as? Int,
+        width > 0, height > 0,
+        let identifier = CGImageSourceGetType(source) as String?,
+        let type = UTType(identifier)
+      else { throw FileOperationRepositoryError.invalidTarget }
+      let lossless =
+        type.conforms(to: .png) || type.conforms(to: .tiff)
+        || type.conforms(to: .bmp) || type.conforms(to: .rawImage)
+      let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+      return DuplicateImageQuality(
+        pixelCount: Int64(width) * Int64(height),
+        bitDepth: properties[kCGImagePropertyDepth] as? Int ?? 8,
+        isLossless: lossless, fileSize: Int64(size))
     }
   }
 

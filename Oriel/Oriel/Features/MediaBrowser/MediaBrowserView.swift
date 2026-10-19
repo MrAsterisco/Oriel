@@ -15,6 +15,7 @@ struct MediaBrowserView: View {
   @State private var moveTarget: FileOperationTarget?
   @State private var namePrompt: FileNamePrompt?
   @State private var proposedName = ""
+  @State private var isPersonImagePickerPresented = false
 
   #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -81,16 +82,49 @@ struct MediaBrowserView: View {
                 if model.fileOperationCapabilities[picture.item.id.url.standardizedFileURL]?
                   .canModify == true
                 {
+                  Button("Rotate Clockwise", systemImage: "rotate.right") {
+                    Task { await model.rotatePictureClockwise() }
+                  }
+                  .disabled(model.isSavingViewerMode)
+
                   Button("Crop", systemImage: "crop") {
                     model.beginCrop()
                     isMediaViewerFocused = true
                   }
+                  .disabled(model.isSavingViewerMode)
                 }
+              }
+            }
+          } else if isPeopleAlbum {
+            ToolbarItem(placement: .navigation) {
+              Button("People", systemImage: "chevron.backward") {
+                Task { await model.selectDestination(.people) }
               }
             }
           } else if case .folder = model.selectedDestination {
             ToolbarItem(placement: .primaryAction) {
+              Toggle(
+                "Show Duplicates", systemImage: "square.on.square",
+                isOn: Binding(
+                  get: { model.showsFolderDuplicates },
+                  set: { isEnabled in Task { await model.setShowsFolderDuplicates(isEnabled) } }
+                )
+              )
+              .toggleStyle(.button)
+              .help("Show Duplicates in This Folder")
+            }
+            ToolbarItem(placement: .primaryAction) {
               sortMenu
+            }
+          }
+
+          if model.openedMedia == nil,
+            model.selectedDestination == .people || model.selectedDestination == .personSearch
+          {
+            ToolbarItem(placement: .primaryAction) {
+              Button("Search for person", systemImage: "person.crop.rectangle.badge.plus") {
+                isPersonImagePickerPresented = true
+              }
             }
           }
 
@@ -150,6 +184,17 @@ struct MediaBrowserView: View {
       FileInfoView(info: info)
     }
     .fileImporter(
+      isPresented: $isPersonImagePickerPresented,
+      allowedContentTypes: [.image], allowsMultipleSelection: false
+    ) { result in
+      switch result {
+      case .success(let urls):
+        if let url = urls.first { Task { await model.searchForPerson(using: url) } }
+      case .failure(let error):
+        model.personImageImportFailed(error)
+      }
+    }
+    .fileImporter(
       isPresented: movePickerIsPresented,
       allowedContentTypes: [.folder],
       allowsMultipleSelection: false
@@ -166,6 +211,12 @@ struct MediaBrowserView: View {
     List(selection: selectedDestination) {
       Label("Recents", systemImage: "clock")
         .tag(MediaBrowserDestination.recents)
+      Label("Duplicates", systemImage: "square.on.square")
+        .badge(model.duplicateGroupCount)
+        .tag(MediaBrowserDestination.duplicates)
+      Label("People", systemImage: "person.2")
+        .badge(model.people.count)
+        .tag(MediaBrowserDestination.people)
 
       if let folderTree = model.filteredFolderTree {
         Section("Folders") {
@@ -235,9 +286,64 @@ struct MediaBrowserView: View {
 
   @ViewBuilder
   private var mediaBrowserContent: some View {
+    if model.selectedDestination == .people {
+      PeopleGalleryView(
+        people: model.people, isScanning: model.isScanningPeople,
+        errorMessage: model.peopleErrorMessage,
+        onOpen: { person in Task { await model.selectDestination(.person(person.id)) } },
+        onRetry: { Task { await model.retry() } })
+    } else {
+      VStack(spacing: 0) {
+        if model.selectedDestination == .personSearch {
+          PersonSearchHeaderView(
+            faces: model.personSearchFaces, selectedIndex: model.personSearchFaceIndex,
+            isSearching: model.isSearchingPerson, errorMessage: model.personSearchErrorMessage,
+            onSelect: { model.selectPersonSearchFace(at: $0) },
+            onRetry: { Task { await model.retry() } })
+          Divider()
+        }
+        if case .person = model.selectedDestination {
+          if model.isScanningPeople {
+            HStack {
+              ProgressView().controlSize(.small)
+              Text("Scanning for people…").font(.callout).foregroundStyle(.secondary)
+              Spacer()
+            }.padding()
+            Divider()
+          }
+          if let message = model.peopleErrorMessage {
+            HStack {
+              Label(message, systemImage: "exclamationmark.triangle")
+              Spacer()
+              Button("Try Again") { Task { await model.retry() } }
+            }.padding()
+            Divider()
+          }
+        }
+        if model.isShowingDuplicates && model.isScanningDuplicates {
+          HStack {
+            ProgressView().progressViewStyle(.circular).controlSize(.small)
+            Text("Scanning for duplicates…")
+              .font(.callout).foregroundStyle(.secondary)
+            Spacer()
+          }
+          .padding()
+          .fixedSize(horizontal: false, vertical: true)
+          Divider()
+        }
+        mediaBrowserResults
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var mediaBrowserResults: some View {
     if model.isLoading {
-      ProgressView("Loading Media…")
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      ProgressView(
+        model.isShowingDuplicates ? "Finding Duplicates…" : "Loading Media…"
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
     } else if let errorMessage = model.errorMessage {
       ContentUnavailableView {
         Label("Couldn’t Read Folder", systemImage: "folder.badge.questionmark")
@@ -246,12 +352,34 @@ struct MediaBrowserView: View {
       } actions: {
         Button("Try Again") { Task { await model.retry() } }
       }
-    } else if model.mediaItems.isEmpty {
+    } else if model.mediaItems.isEmpty && model.isShowingDuplicates
+      && model.isScanningDuplicates
+    {
       ContentUnavailableView(
-        "No Pictures or Videos",
-        systemImage: "photo.on.rectangle.angled",
-        description: Text(emptyStateDescription)
-      )
+        "Looking for Duplicates", systemImage: "square.on.square",
+        description: Text("Matching pictures will appear here as they’re found."))
+    } else if model.mediaItems.isEmpty {
+      if model.selectedDestination == .personSearch {
+        ContentUnavailableView(
+          model.isSearchingPerson
+            ? "Searching for Person…"
+            : model.personSearchFaceIndex == nil ? "Choose a Person" : "No Matching Photos",
+          systemImage: "person.crop.rectangle",
+          description: Text(
+            model.personSearchErrorMessage != nil
+              ? "Choose another image or try again."
+              : model.isSearchingPerson
+                ? "Matching photos will appear here as they’re found."
+                : model.personSearchFaceIndex == nil
+                  ? "Choose a face above, or use Search for person to select an image."
+                  : "Search covers all pictures in this folder and its subfolders."))
+      } else {
+        ContentUnavailableView(
+          model.isShowingDuplicates ? "No Duplicates" : "No Pictures or Videos",
+          systemImage: "photo.on.rectangle.angled",
+          description: Text(emptyStateDescription)
+        )
+      }
     } else {
       mediaGrid
     }
@@ -266,10 +394,14 @@ struct MediaBrowserView: View {
     #if os(macOS)
       MacMediaCollectionView(
         items: model.mediaItems,
+        sections: model.mediaSections,
+        preferredDuplicateIDs: model.preferredDuplicateIDs,
+        isCleaningDuplicates: model.isCleaningDuplicates,
+        onKeepBestCopy: { section in Task { await model.keepBestCopy(in: section) } },
         itemsByID: model.mediaItemsByID,
         itemsRevision: model.mediaItemsRevision,
         selectedMediaID: model.selectedMediaID,
-        isViewingRecents: model.selectedDestination == .recents,
+        isViewingAggregate: model.selectedFolder == nil,
         thumbnails: model.mediaThumbnails,
         capabilities: { capabilities(for: .media($0)) },
         openingApplications: { model.openingApplications[FileOperationTarget.media($0).id] },
@@ -294,10 +426,23 @@ struct MediaBrowserView: View {
           columns: [GridItem(.adaptive(minimum: 150, maximum: 240), spacing: 0)],
           spacing: 0
         ) {
-          ForEach(model.mediaItems) { item in
-            mediaCell(for: item)
-              .task(id: item) { await model.loadThumbnail(for: item) }
-              .onDisappear { model.discardThumbnail(for: item) }
+          ForEach(model.mediaSections) { section in
+            Section {
+              ForEach(section.items) { item in
+                mediaCell(for: item)
+                  .task(id: item) { await model.loadThumbnail(for: item) }
+                  .onDisappear { model.discardThumbnail(for: item) }
+              }
+            } header: {
+              if let title = section.title {
+                MediaSectionHeading(
+                  title: title,
+                  isCleaningDuplicates: model.isCleaningDuplicates,
+                  onKeepBestCopy: { Task { await model.keepBestCopy(in: section) } }
+                )
+                .padding()
+              }
+            }
           }
         }
       }
@@ -326,7 +471,8 @@ struct MediaBrowserView: View {
     MediaCell(
       item: item,
       thumbnail: model.thumbnail(for: item),
-      isSelected: model.selectedMediaID == item.id
+      isSelected: model.selectedMediaID == item.id,
+      isPreferredDuplicate: model.preferredDuplicateIDs.contains(item.id)
     )
     .contentShape(.rect)
     .onTapGesture {
@@ -394,7 +540,7 @@ struct MediaBrowserView: View {
       Task { await model.navigate(direction) }
       return .handled
     }
-    .task(id: picture.item) {
+    .task(id: PictureCapabilityTask(item: picture.item, revision: model.mediaItemsRevision)) {
       await model.loadFileOperationCapabilities(for: .media(picture.item))
     }
   }
@@ -523,7 +669,7 @@ struct MediaBrowserView: View {
       if capabilities.canModify {
         Button("Move To…", systemImage: "folder") { moveTarget = target }
       }
-      if model.selectedDestination == .recents {
+      if model.selectedFolder == nil {
         Button("Reveal in Folder", systemImage: "folder") {
           Task { await model.revealInFolder(item) }
         }
@@ -727,12 +873,20 @@ struct MediaBrowserView: View {
 
   private var selectedDestination: Binding<MediaBrowserDestination?> {
     Binding(
-      get: { model.selectedDestination },
+      get: {
+        if isPeopleAlbum { return .people }
+        return model.selectedDestination
+      },
       set: { destination in
         guard let destination else { return }
         Task { await model.selectDestination(destination) }
       }
     )
+  }
+
+  private var isPeopleAlbum: Bool {
+    if case .person = model.selectedDestination { return true }
+    return model.selectedDestination == .personSearch
   }
 
   private var selectedMediaItem: MediaItem? {
@@ -773,6 +927,12 @@ struct MediaBrowserView: View {
   }
 
   private var emptyStateDescription: String {
+    if model.showsFolderDuplicates {
+      return "No visually matching pictures were found in this folder."
+    }
+    if model.selectedDestination == .duplicates {
+      return "No visually matching pictures were found in this folder or its subfolders."
+    }
     if model.selectedDestination == .recents {
       return "This folder and its subfolders don’t contain supported media."
     }
@@ -796,6 +956,11 @@ struct MediaBrowserView: View {
     guard model.mediaSort.option == option else { return "circle" }
     return model.mediaSort.direction == .ascending ? "arrow.up" : "arrow.down"
   }
+}
+
+private struct PictureCapabilityTask: Hashable {
+  let item: MediaItem
+  let revision: Int
 }
 
 private struct MediaVideoPlayer: View {
@@ -933,6 +1098,7 @@ struct MediaCell: View {
   let item: MediaItem
   let thumbnail: MediaThumbnail?
   let isSelected: Bool
+  var isPreferredDuplicate = false
 
   var body: some View {
     Rectangle()
@@ -959,13 +1125,33 @@ struct MediaCell: View {
       }
       .clipped()
       .overlay {
+        if isPreferredDuplicate {
+          RoundedRectangle(cornerRadius: 5)
+            .strokeBorder(.green, lineWidth: 3)
+            .padding(isSelected ? 5 : 0)
+            .allowsHitTesting(false)
+        }
+      }
+      .overlay {
         if isSelected {
           RoundedRectangle(cornerRadius: 5)
             .strokeBorder(appearsActive ? Color.accentColor : Color.secondary, lineWidth: 4)
         }
       }
+      .overlay(alignment: .topTrailing) {
+        if isPreferredDuplicate {
+          Image(systemName: "checkmark.circle.fill")
+            .font(.title2)
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(.white, .green)
+            .padding(8)
+            .help("This copy will be kept")
+            .allowsHitTesting(false)
+        }
+      }
       .accessibilityElement(children: .combine)
       .accessibilityLabel(item.name)
+      .accessibilityValue(isPreferredDuplicate ? "Best copy — will be kept" : "")
       .accessibilityAddTraits(isSelected ? .isSelected : [])
   }
 }
@@ -1095,6 +1281,25 @@ extension View {
         RoundedRectangle(cornerRadius: 6)
           .fill(Color.accentColor.opacity(0.16))
       }
+    }
+  }
+}
+
+struct MediaSectionHeading: View {
+  let title: String
+  let isCleaningDuplicates: Bool
+  let onKeepBestCopy: () -> Void
+
+  var body: some View {
+    HStack {
+      Text(title).font(.headline).lineLimit(1).truncationMode(.middle)
+      Spacer()
+      Button("Keep Best Copy", action: onKeepBestCopy)
+        .controlSize(.small)
+        .disabled(isCleaningDuplicates)
+        .help(
+          "Keep the highest resolution, then greatest bit depth, lossless format, and largest file. Move other copies to Trash."
+        )
     }
   }
 }

@@ -17,10 +17,14 @@
 
   struct MacMediaCollectionView: NSViewRepresentable {
     let items: [MediaItem]
+    let sections: [MediaSection]
+    let preferredDuplicateIDs: Set<MediaItem.ID>
+    let isCleaningDuplicates: Bool
+    let onKeepBestCopy: (MediaSection) -> Void
     let itemsByID: [MediaItem.ID: MediaItem]
     let itemsRevision: Int
     let selectedMediaID: MediaItem.ID?
-    let isViewingRecents: Bool
+    let isViewingAggregate: Bool
     let thumbnails: [MediaItem.ID: MediaThumbnail]
     let capabilities: (MediaItem) -> FileOperationCapabilities
     let openingApplications: (MediaItem) -> [FileOpeningApplication]?
@@ -53,6 +57,11 @@
       collectionView.register(
         MediaCollectionItem.self,
         forItemWithIdentifier: MediaCollectionItem.identifier
+      )
+      collectionView.register(
+        MediaSectionHeader.self,
+        forSupplementaryViewOfKind: NSCollectionView.elementKindSectionHeader,
+        withIdentifier: MediaSectionHeader.identifier
       )
       context.coordinator.installDataSource(in: collectionView)
       collectionView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
@@ -94,8 +103,9 @@
       var parent: MacMediaCollectionView
       private var appliedItems: [MediaItem.ID: MediaItem] = [:]
       private var appliedItemsRevision: Int?
+      private var appliedSections: [MediaSection] = []
       private weak var collectionView: NSCollectionView?
-      private var dataSource: NSCollectionViewDiffableDataSource<Int, MediaItem.ID>?
+      private var dataSource: NSCollectionViewDiffableDataSource<MediaItem.ID, MediaItem.ID>?
       private weak var menuAnchor: NSView?
       private var sharingPicker: NSSharingServicePicker?
       private var thumbnailTaskIDs: [MediaItem.ID: UUID] = [:]
@@ -107,7 +117,7 @@
 
       func installDataSource(in collectionView: NSCollectionView) {
         self.collectionView = collectionView
-        dataSource = NSCollectionViewDiffableDataSource<Int, MediaItem.ID>(
+        dataSource = NSCollectionViewDiffableDataSource<MediaItem.ID, MediaItem.ID>(
           collectionView: collectionView
         ) { [weak self] collectionView, indexPath, itemID in
           guard let self, let item = mediaItem(with: itemID) else { return nil }
@@ -118,6 +128,17 @@
             ) as! MediaCollectionItem
           configure(collectionItem, with: item)
           return collectionItem
+        }
+        dataSource?.supplementaryViewProvider = { [weak self] collectionView, kind, indexPath in
+          let header =
+            collectionView.makeSupplementaryView(
+              ofKind: kind,
+              withIdentifier: MediaSectionHeader.identifier,
+              for: indexPath
+            ) as! MediaSectionHeader
+          guard let self, parent.sections.indices.contains(indexPath.section) else { return header }
+          configure(header, section: parent.sections[indexPath.section])
+          return header
         }
         applySnapshotIfNeeded()
       }
@@ -135,11 +156,21 @@
         }
         appliedItems = parent.itemsByID
         appliedItemsRevision = parent.itemsRevision
-        guard previousItemIDs != itemIDs || !changedItemIDs.isEmpty else { return false }
+        let sectionsChanged = appliedSections != parent.sections
+        let headerVisibilityChanged =
+          appliedSections.contains { $0.title != nil }
+          != parent.sections.contains { $0.title != nil }
+        appliedSections = parent.sections
+        guard previousItemIDs != itemIDs || !changedItemIDs.isEmpty || sectionsChanged else {
+          return false
+        }
 
-        var snapshot = NSDiffableDataSourceSnapshot<Int, MediaItem.ID>()
-        snapshot.appendSections([0])
-        snapshot.appendItems(itemIDs, toSection: 0)
+        var snapshot = NSDiffableDataSourceSnapshot<MediaItem.ID, MediaItem.ID>()
+        for section in parent.sections {
+          snapshot.appendSections([section.id])
+          snapshot.appendItems(section.items.map(\.id), toSection: section.id)
+        }
+        if headerVisibilityChanged { collectionView?.collectionViewLayout?.invalidateLayout() }
         snapshot.reloadItems(changedItemIDs)
         dataSource.apply(snapshot, animatingDifferences: !previousItemIDs.isEmpty) { [weak self] in
           guard let self, let collectionView = self.collectionView else { return }
@@ -162,6 +193,17 @@
 
       func collectionView(
         _ collectionView: NSCollectionView,
+        layout collectionViewLayout: NSCollectionViewLayout,
+        referenceSizeForHeaderInSection section: Int
+      ) -> NSSize {
+        guard parent.sections.indices.contains(section),
+          parent.sections[section].title != nil
+        else { return .zero }
+        return NSSize(width: collectionView.bounds.width, height: 40)
+      }
+
+      func collectionView(
+        _ collectionView: NSCollectionView,
         didSelectItemsAt indexPaths: Set<IndexPath>
       ) {
         selectionChanged(in: collectionView)
@@ -180,7 +222,13 @@
         forRepresentedObjectAt indexPath: IndexPath
       ) {
         guard let mediaItem = mediaItem(at: indexPath) else { return }
-        guard thumbnailTasks[mediaItem.id] == nil else { return }
+        loadThumbnailIfNeeded(for: mediaItem)
+      }
+
+      private func loadThumbnailIfNeeded(for mediaItem: MediaItem) {
+        guard parent.thumbnails[mediaItem.id] == nil, thumbnailTasks[mediaItem.id] == nil else {
+          return
+        }
         let taskID = UUID()
         thumbnailTaskIDs[mediaItem.id] = taskID
         thumbnailTasks[mediaItem.id] = Task { [weak self] in
@@ -189,6 +237,9 @@
           guard thumbnailTaskIDs[mediaItem.id] == taskID else { return }
           thumbnailTaskIDs[mediaItem.id] = nil
           thumbnailTasks[mediaItem.id] = nil
+          if let current = parent.itemsByID[mediaItem.id], current != mediaItem {
+            loadThumbnailIfNeeded(for: current)
+          }
         }
       }
 
@@ -198,9 +249,18 @@
         forRepresentedObjectAt indexPath: IndexPath
       ) {
         guard let mediaItem = (item as? MediaCollectionItem)?.mediaItem else { return }
-        thumbnailTaskIDs[mediaItem.id] = nil
-        thumbnailTasks.removeValue(forKey: mediaItem.id)?.cancel()
-        parent.onDiscardThumbnail(mediaItem)
+        // Diffable updates can replace a cell while its media item remains on screen.
+        Task { @MainActor [weak self, weak collectionView] in
+          guard let self, let collectionView else { return }
+          guard
+            !collectionView.visibleItems().contains(where: {
+              ($0 as? MediaCollectionItem)?.mediaItem?.id == mediaItem.id
+            })
+          else { return }
+          thumbnailTaskIDs[mediaItem.id] = nil
+          thumbnailTasks.removeValue(forKey: mediaItem.id)?.cancel()
+          parent.onDiscardThumbnail(mediaItem)
+        }
       }
 
       func cancelThumbnailLoads() {
@@ -236,7 +296,23 @@
         collectionView.selectionIndexPaths = selection
       }
 
+      private func configure(_ header: MediaSectionHeader, section: MediaSection) {
+        header.configure(
+          MediaSectionHeading(
+            title: section.title ?? "",
+            isCleaningDuplicates: parent.isCleaningDuplicates,
+            onKeepBestCopy: { [weak self] in self?.parent.onKeepBestCopy(section) }))
+      }
+
       func updateVisibleItems(in collectionView: NSCollectionView) {
+        for index in parent.sections.indices {
+          if let header = collectionView.supplementaryView(
+            forElementKind: NSCollectionView.elementKindSectionHeader,
+            at: IndexPath(item: 0, section: index)
+          ) as? MediaSectionHeader {
+            configure(header, section: parent.sections[index])
+          }
+        }
         for collectionItem in collectionView.visibleItems() {
           guard let indexPath = collectionView.indexPath(for: collectionItem),
             let collectionItem = collectionItem as? MediaCollectionItem
@@ -244,6 +320,7 @@
             continue
           }
           configure(collectionItem, at: indexPath)
+          if let item = mediaItem(at: indexPath) { loadThumbnailIfNeeded(for: item) }
         }
       }
 
@@ -278,7 +355,7 @@
         if capabilities.canModify {
           add(.move, title: "Move To…", symbol: "folder", item: item, to: menu)
         }
-        if parent.isViewingRecents {
+        if parent.isViewingAggregate {
           add(.revealInFolder, title: "Reveal in Folder", symbol: "folder", item: item, to: menu)
         }
         add(.reveal, title: "Show in Finder", symbol: "finder", item: item, to: menu)
@@ -303,7 +380,9 @@
       }
 
       private func configure(_ collectionItem: MediaCollectionItem, with item: MediaItem) {
-        collectionItem.configure(item: item, thumbnail: parent.thumbnails[item.id])
+        collectionItem.configure(
+          item: item, thumbnail: parent.thumbnails[item.id],
+          isPreferredDuplicate: parent.preferredDuplicateIDs.contains(item.id))
       }
 
       private func selectionChanged(in collectionView: NSCollectionView) {
@@ -425,6 +504,27 @@
     }
   }
 
+  private final class MediaSectionHeader: NSView, NSCollectionViewElement {
+    static let identifier = NSUserInterfaceItemIdentifier("MediaSectionHeader")
+    private var hostingView: NSHostingView<MediaSectionHeading>?
+
+    func configure(_ content: MediaSectionHeading) {
+      if let hostingView {
+        hostingView.rootView = content
+        return
+      }
+      let hostingView = NSHostingView(rootView: content)
+      hostingView.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(hostingView)
+      NSLayoutConstraint.activate([
+        hostingView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+        hostingView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+        hostingView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      ])
+      self.hostingView = hostingView
+    }
+  }
+
   private final class MediaCollectionView: NSCollectionView {
     var itemActivated: ((IndexPath) -> Void)?
     var menuForItem: ((IndexPath, NSView) -> NSMenu?)?
@@ -467,6 +567,7 @@
     private var hostingView: NSHostingView<MediaCell>?
     private(set) var mediaItem: MediaItem?
     private var thumbnail: MediaThumbnail?
+    private var isPreferredDuplicate = false
 
     override var isSelected: Bool {
       didSet { updateContent() }
@@ -480,10 +581,12 @@
       view = NSView()
     }
 
-    func configure(item: MediaItem, thumbnail: MediaThumbnail?) {
+    func configure(item: MediaItem, thumbnail: MediaThumbnail?, isPreferredDuplicate: Bool) {
       let itemChanged = mediaItem != item
       let thumbnailChanged = self.thumbnail?.image.cgImage !== thumbnail?.image.cgImage
-      guard itemChanged || thumbnailChanged else { return }
+      guard itemChanged || thumbnailChanged || self.isPreferredDuplicate != isPreferredDuplicate
+      else { return }
+      self.isPreferredDuplicate = isPreferredDuplicate
       mediaItem = item
       self.thumbnail = thumbnail
       updateContent()
@@ -494,7 +597,8 @@
       let content = MediaCell(
         item: mediaItem,
         thumbnail: thumbnail,
-        isSelected: isSelected || highlightState == .forSelection
+        isSelected: isSelected || highlightState == .forSelection,
+        isPreferredDuplicate: isPreferredDuplicate
       )
       if let hostingView {
         hostingView.rootView = content

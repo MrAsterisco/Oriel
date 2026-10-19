@@ -309,20 +309,110 @@ struct FileOperationRepositoryTests {
         in: rootFolder
       )
     }
+    await #expect(throws: FileOperationRepositoryError.self) {
+      try await LocalFileOperationRepository().rotatePictureClockwise(item, in: rootFolder)
+    }
     #expect(imageFrameCount(at: originalURL) == 2)
   }
 
+  @Test
+  func rotatesPictureClockwiseInPlace() async throws {
+    let fileManager = FileManager.default
+    let rootURL = fileManager.temporaryDirectory.appending(
+      path: UUID().uuidString,
+      directoryHint: .isDirectory
+    )
+    try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: rootURL) }
+
+    let url = rootURL.appending(path: "split.png")
+    try writeSplitPNG(at: url)
+    let folder = Folder(
+      id: Folder.ID(),
+      name: rootURL.lastPathComponent,
+      path: rootURL.path,
+      url: rootURL
+    )
+    let repository = LocalFileOperationRepository()
+    let item = mediaItem(at: url)
+
+    let rotatedURL = try await repository.rotatePictureClockwise(
+      item,
+      in: folder
+    )
+    #expect(rotatedURL == url)
+    #expect(imageSize(at: url) == MediaPixelSize(width: 4, height: 6))
+    #expect(imageOrientation(at: url) == 6)
+    let image = try #require(orientedImage(at: url))
+    #expect(
+      MediaPixelSize(width: image.width, height: image.height)
+        == MediaPixelSize(width: 6, height: 4)
+    )
+
+    let left = try #require(image.cropping(to: CGRect(x: 0, y: 0, width: 3, height: 4)))
+    let right = try #require(image.cropping(to: CGRect(x: 3, y: 0, width: 3, height: 4)))
+    let leftColor = try #require(averageColor(of: left))
+    let rightColor = try #require(averageColor(of: right))
+    #expect(leftColor.blue > 240 && leftColor.red < 15)
+    #expect(rightColor.red > 240 && rightColor.blue < 15)
+
+    _ = try await repository.rotatePictureClockwise(item, in: folder)
+    #expect(imageOrientation(at: url) == 3)
+    let twiceRotated = try #require(orientedImage(at: url))
+    #expect(
+      MediaPixelSize(width: twiceRotated.width, height: twiceRotated.height)
+        == MediaPixelSize(width: 4, height: 6)
+    )
+  }
+
+  @Test
+  func rotatesJPEGWithoutReencodingPixels() async throws {
+    let rootURL = FileManager.default.temporaryDirectory.appending(
+      path: UUID().uuidString,
+      directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: rootURL) }
+
+    let pngURL = rootURL.appending(path: "split.png")
+    let jpegURL = rootURL.appending(path: "split.jpg")
+    try writeSplitPNG(at: pngURL)
+    let source = try #require(CGImageSourceCreateWithURL(pngURL as CFURL, nil))
+    let destination = try #require(
+      CGImageDestinationCreateWithURL(jpegURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+    )
+    CGImageDestinationAddImageFromSource(destination, source, 0, nil)
+    #expect(CGImageDestinationFinalize(destination))
+
+    let folder = Folder(id: Folder.ID(), name: "Pictures", path: rootURL.path, url: rootURL)
+    _ = try await LocalFileOperationRepository().rotatePictureClockwise(
+      mediaItem(at: jpegURL),
+      in: folder
+    )
+
+    #expect(imageType(at: jpegURL) == UTType.jpeg.identifier)
+    #expect(imageSize(at: jpegURL) == MediaPixelSize(width: 4, height: 6))
+    #expect(imageOrientation(at: jpegURL) == 6)
+    let image = try #require(orientedImage(at: jpegURL))
+    #expect(
+      MediaPixelSize(width: image.width, height: image.height)
+        == MediaPixelSize(width: 6, height: 4)
+    )
+  }
+
   private func mediaTarget(at url: URL) -> FileOperationTarget {
-    .media(
-      MediaItem(
-        id: MediaItem.ID(url: url),
-        name: url.lastPathComponent,
-        kind: .picture,
-        dateAdded: nil,
-        fileSize: nil,
-        modificationDate: nil,
-        relativePath: url.lastPathComponent
-      )
+    .media(mediaItem(at: url))
+  }
+
+  private func mediaItem(at url: URL) -> MediaItem {
+    MediaItem(
+      id: MediaItem.ID(url: url),
+      name: url.lastPathComponent,
+      kind: .picture,
+      dateAdded: nil,
+      fileSize: nil,
+      modificationDate: nil,
+      relativePath: url.lastPathComponent
     )
   }
 
@@ -349,7 +439,7 @@ struct FileOperationRepositoryTests {
 
   private func writeSplitPNG(at url: URL) throws {
     let width = 4
-    let height = 4
+    let height = 6
     var pixels = [UInt8](repeating: 255, count: width * height * 4)
     for y in 0..<height {
       for x in 0..<width {
@@ -422,11 +512,15 @@ struct FileOperationRepositoryTests {
   private func averageColor(at url: URL) -> (red: UInt8, green: UInt8, blue: UInt8)? {
     guard
       let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-      let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
     else {
       return nil
     }
+    return averageColor(of: image)
+  }
+
+  private func averageColor(of image: CGImage) -> (red: UInt8, green: UInt8, blue: UInt8)? {
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
 
     var pixel = [UInt8](repeating: 0, count: 4)
     guard
@@ -460,9 +554,32 @@ struct FileOperationRepositoryTests {
     return MediaPixelSize(width: width, height: height)
   }
 
+  private func orientedImage(at url: URL) -> CGImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    return CGImageSourceCreateThumbnailAtIndex(
+      source,
+      0,
+      [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: 100,
+      ] as CFDictionary
+    )
+  }
+
   private func imageType(at url: URL) -> String? {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
     return CGImageSourceGetType(source) as String?
+  }
+
+  private func imageOrientation(at url: URL) -> Int? {
+    guard
+      let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+    else {
+      return nil
+    }
+    return (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue
   }
 
   private func imageFrameCount(at url: URL) -> Int? {

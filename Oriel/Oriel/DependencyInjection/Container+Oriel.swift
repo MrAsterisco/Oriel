@@ -21,6 +21,18 @@ extension Container {
       .singleton
   }
 
+  var faceRecognitionRepository: Factory<any FaceRecognitionRepository> {
+    self { VisionFaceRecognitionRepository() }
+      .singleton
+  }
+
+  var peopleRepository: Factory<any PeopleRepository> {
+    self {
+      LocalPeopleRepository(media: self.mediaRepository(), faces: self.faceRecognitionRepository())
+    }
+    .singleton
+  }
+
   @MainActor
   var recentsFolderRepository: Factory<any RecentsFolderRepository> {
     #if os(macOS)
@@ -49,6 +61,7 @@ extension Container {
       MediaBrowserFeatureModel(
         folder: $0,
         mediaRepository: self.mediaRepository(),
+        peopleRepository: self.peopleRepository(),
         fileOperations: self.fileOperationRepository(),
         folderAccess: self.folderAccessRepository()
       )

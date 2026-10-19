@@ -12,6 +12,23 @@ protocol MediaBrowserFeatureModelProtocol: AnyObject, Observable {
   var alertMessage: String? { get }
   var alertTitle: String { get }
   var errorMessage: String? { get }
+  var duplicateGroupCount: Int { get }
+  var isScanningDuplicates: Bool { get }
+  var showsFolderDuplicates: Bool { get }
+  var isShowingDuplicates: Bool { get }
+  var isScanningPeople: Bool { get }
+  var people: [PersonGroup] { get }
+  var peopleErrorMessage: String? { get }
+  var personSearchFaces: [DetectedFace] { get }
+  var personSearchFaceIndex: Int? { get }
+  var isSearchingPerson: Bool { get }
+  var personSearchErrorMessage: String? { get }
+  func searchForPerson(using url: URL) async
+  func personImageImportFailed(_ error: any Error)
+  func selectPersonSearchFace(at index: Int)
+  var isCleaningDuplicates: Bool { get }
+  var preferredDuplicateIDs: Set<MediaItem.ID> { get }
+  func keepBestCopy(in section: MediaSection) async
   var fileOperationCapabilities: [URL: FileOperationCapabilities] { get }
   var filteredFolderTree: MediaFolder? { get }
   var folderSearchText: String { get }
@@ -23,6 +40,7 @@ protocol MediaBrowserFeatureModelProtocol: AnyObject, Observable {
   var mediaItems: [MediaItem] { get }
   var mediaItemsByID: [MediaItem.ID: MediaItem] { get }
   var mediaItemsRevision: Int { get }
+  var mediaSections: [MediaSection] { get }
   var mediaThumbnails: [MediaItem.ID: MediaThumbnail] { get }
   var openedMedia: OpenedMedia? { get }
   var panOffset: CGSize { get }
@@ -57,12 +75,14 @@ protocol MediaBrowserFeatureModelProtocol: AnyObject, Observable {
   func reveal(_ target: FileOperationTarget) async
   func revealInFolder(_ item: MediaItem) async
   func retry() async
+  func rotatePictureClockwise() async
   func run() async
   func saveCrop(asCopy: Bool) async
   func selectDestination(_ destination: MediaBrowserDestination) async
   func selectMedia(_ item: MediaItem?)
   func selectSortOption(_ option: MediaSortOption) async
   func setFolderSearchText(_ text: String)
+  func setShowsFolderDuplicates(_ isEnabled: Bool) async
   func setCropRect(_ rect: MediaNormalizedRect)
   func setViewerTransform(zoomScale: CGFloat, panOffset: CGSize)
   func thumbnail(for item: MediaItem) -> MediaThumbnail?
@@ -89,6 +109,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private let folder: Folder
   private let folderAccess: any FolderAccessRepository
   private let mediaRepository: any MediaRepository
+  private let peopleRepository: any PeopleRepository
   private let fileChangeRefreshDelay: Duration
   private var isObserving = false
   private var isReadingSnapshot = false
@@ -97,6 +118,32 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private var needsRefreshAfterCurrent = false
   private var refreshSequence = 0
   private var refreshTask: Task<Void, Never>?
+  private var duplicateScanTask: Task<Void, Never>?
+  private var duplicateScanID: UUID?
+  private var duplicateScanResult: Result<MediaBrowserSnapshot, any Error>?
+  private var needsDuplicateScan = false
+  private(set) var duplicateGroupCount = 0
+  private(set) var isScanningDuplicates = false
+  private(set) var showsFolderDuplicates = false
+  private(set) var isCleaningDuplicates = false
+  private var isMutatingDuplicateFiles = false
+  private(set) var preferredDuplicateIDs: Set<MediaItem.ID> = []
+  private var duplicateRankingTask: Task<Void, Never>?
+  private var rankedSections: [MediaSection] = []
+  private var duplicateQualities: [MediaItem: DuplicateImageQuality] = [:]
+  private var peopleScanTask: Task<Void, Never>?
+  private var peopleScanID: UUID?
+  private var needsPeopleScan = false
+  private(set) var isScanningPeople = false
+  private(set) var people: [PersonGroup] = []
+  private(set) var peopleErrorMessage: String?
+  private var personSearchTask: Task<Void, Never>?
+  private var personSearchID: UUID?
+  private var personSearchItems: [MediaItem] = []
+  private(set) var personSearchFaces: [DetectedFace] = []
+  private(set) var personSearchFaceIndex: Int?
+  private(set) var isSearchingPerson = false
+  private(set) var personSearchErrorMessage: String?
 
   private(set) var alertMessage: String?
   private(set) var alertTitle = "Couldn’t Open Picture"
@@ -111,6 +158,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private(set) var mediaItems: [MediaItem] = []
   private(set) var mediaItemsByID: [MediaItem.ID: MediaItem] = [:]
   private(set) var mediaItemsRevision = 0
+  private(set) var mediaSections: [MediaSection] = []
   private(set) var mediaThumbnails: [MediaItem.ID: MediaThumbnail] = [:]
   private(set) var openedMedia: OpenedMedia?
   private(set) var panOffset = CGSize.zero
@@ -120,6 +168,10 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private(set) var selectedMediaID: MediaItem.ID?
   private(set) var viewerMode: MediaViewerMode?
   private(set) var zoomScale: CGFloat = 1
+
+  var isShowingDuplicates: Bool {
+    selectedDestination == .duplicates || showsFolderDuplicates
+  }
 
   var filteredFolderTree: MediaFolder? {
     guard let folderTree else { return nil }
@@ -136,12 +188,14 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   init(
     folder: Folder,
     mediaRepository: any MediaRepository,
+    peopleRepository: any PeopleRepository,
     fileOperations: any FileOperationRepository,
     folderAccess: any FolderAccessRepository,
     fileChangeRefreshDelay: Duration = .milliseconds(150)
   ) {
     self.folder = folder
     self.mediaRepository = mediaRepository
+    self.peopleRepository = peopleRepository
     self.fileOperations = fileOperations
     self.folderAccess = folderAccess
     self.fileChangeRefreshDelay = fileChangeRefreshDelay
@@ -152,11 +206,25 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     isObserving = true
     defer {
       isObserving = false
-      if Task.isCancelled { cancelRefresh() }
+      if Task.isCancelled {
+        cancelRefresh()
+        duplicateRankingTask?.cancel()
+        duplicateScanTask?.cancel()
+        duplicateScanTask = nil
+        duplicateScanID = nil
+        isScanningDuplicates = false
+        peopleScanTask?.cancel()
+        peopleScanTask = nil
+        peopleScanID = nil
+        isScanningPeople = false
+        cancelPersonSearch()
+      }
     }
 
     let updates = await mediaRepository.updates(in: folder)
     guard !Task.isCancelled else { return }
+    startDuplicateScan(invalidate: true)
+    startPeopleScan(invalidate: true)
     await refresh(showsLoading: true)
     guard !Task.isCancelled else { return }
     for await _ in updates {
@@ -166,16 +234,137 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   }
 
   func retry() async {
-    await refresh(showsLoading: true)
+    await refresh(showsLoading: true, rescanDuplicates: true)
   }
 
   func selectDestination(_ destination: MediaBrowserDestination) async {
     guard destination != selectedDestination else { return }
+    if destination != .personSearch { cancelPersonSearch() }
     selectedDestination = destination
+    switch destination {
+    case .folder: break
+    default: showsFolderDuplicates = false
+    }
+    duplicateRankingTask?.cancel()
+    rankedSections = []
+    preferredDuplicateIDs = []
     selectedMediaID = nil
     openedMedia = nil
     viewerMode = nil
     resetZoom()
+    await refresh(showsLoading: true)
+  }
+
+  func searchForPerson(using url: URL) async {
+    cancelPersonSearch()
+    personSearchFaces = []
+    personSearchFaceIndex = nil
+    personSearchItems = []
+    personSearchErrorMessage = nil
+    selectedMediaID = nil
+    closeMedia()
+    let searchID = UUID()
+    personSearchID = searchID
+    isSearchingPerson = true
+    await selectDestination(.personSearch)
+    guard selectedDestination == .personSearch, personSearchID == searchID, !Task.isCancelled else {
+      return
+    }
+    applyPersonSearchResults()
+    let repository = peopleRepository
+    personSearchTask = Task { [weak self] in
+      do {
+        let faces = try await repository.referenceFaces(at: url)
+        try Task.checkCancellation()
+        guard let self, self.personSearchID == searchID else { return }
+        self.personSearchFaces = faces
+        self.isSearchingPerson = false
+        self.personSearchTask = nil
+        if faces.count == 1 { self.selectPersonSearchFace(at: 0) }
+      } catch {
+        guard let self, self.personSearchID == searchID, !Task.isCancelled else { return }
+        self.personSearchErrorMessage = error.localizedDescription
+        self.isSearchingPerson = false
+        self.personSearchTask = nil
+      }
+    }
+  }
+
+  func personImageImportFailed(_ error: any Error) {
+    guard (error as? CocoaError)?.code != .userCancelled else { return }
+    alertTitle = "Couldn’t Open Reference Image"
+    alertMessage = error.localizedDescription
+  }
+
+  func selectPersonSearchFace(at index: Int) {
+    guard selectedDestination == .personSearch, personSearchFaces.indices.contains(index) else {
+      return
+    }
+    personSearchFaceIndex = index
+    personSearchItems = []
+    selectedMediaID = nil
+    closeMedia()
+    applyPersonSearchResults()
+    startPersonSearch()
+  }
+
+  private func cancelPersonSearch() {
+    personSearchTask?.cancel()
+    personSearchTask = nil
+    personSearchID = nil
+    isSearchingPerson = false
+  }
+
+  private func startPersonSearch(after delay: Duration = .zero) {
+    guard selectedDestination == .personSearch, let index = personSearchFaceIndex else { return }
+    cancelPersonSearch()
+    let searchID = UUID()
+    personSearchID = searchID
+    isSearchingPerson = true
+    personSearchErrorMessage = nil
+    let repository = peopleRepository
+    let root = folder
+    let face = personSearchFaces[index]
+    let retainsResults = !personSearchItems.isEmpty
+    personSearchTask = Task { [weak self] in
+      do {
+        if delay > .zero { try await Task.sleep(for: delay) }
+        var latest: [MediaItem] = []
+        for try await items in await repository.pictures(matching: face, in: root) {
+          try Task.checkCancellation()
+          guard let self, self.personSearchID == searchID else { return }
+          latest = items
+          if !retainsResults {
+            self.personSearchItems = items
+            self.applyPersonSearchResults()
+          }
+        }
+        try Task.checkCancellation()
+        guard let self, self.personSearchID == searchID else { return }
+        self.personSearchItems = latest
+        self.isSearchingPerson = false
+        self.personSearchTask = nil
+        self.applyPersonSearchResults()
+      } catch {
+        guard let self, self.personSearchID == searchID, !Task.isCancelled else { return }
+        self.personSearchErrorMessage = error.localizedDescription
+        self.isSearchingPerson = false
+        self.personSearchTask = nil
+      }
+    }
+  }
+
+  private func applyPersonSearchResults() {
+    guard selectedDestination == .personSearch, refreshTask == nil, let folderTree else { return }
+    apply(
+      MediaBrowserSnapshot(
+        folderTree: folderTree, selectedFolder: nil, mediaItems: personSearchItems),
+      sequence: refreshSequence)
+  }
+
+  func setShowsFolderDuplicates(_ isEnabled: Bool) async {
+    guard case .folder = selectedDestination, showsFolderDuplicates != isEnabled else { return }
+    showsFolderDuplicates = isEnabled
     await refresh(showsLoading: true)
   }
 
@@ -187,7 +376,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     } else {
       mediaSort = MediaSort(option: option, direction: .ascending)
     }
-    await refresh()
+    await refresh(rescanDuplicates: true)
   }
 
   func setFolderSearchText(_ text: String) {
@@ -242,10 +431,12 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   }
 
   func loadFileOperationCapabilities(for target: FileOperationTarget) async {
-    fileOperationCapabilities[target.id] = await fileOperations.capabilities(
+    let capabilities = await fileOperations.capabilities(
       for: target,
       in: folder
     )
+    guard !Task.isCancelled else { return }
+    fileOperationCapabilities[target.id] = capabilities
   }
 
   func rename(_ target: FileOperationTarget, to name: String) async {
@@ -258,6 +449,130 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     await performMutation {
       try await fileOperations.duplicate(target, in: folder)
     }
+  }
+
+  func keepBestCopy(in section: MediaSection) async {
+    guard !isCleaningDuplicates,
+      isShowingDuplicates,
+      let current = mediaSections.first(where: { $0.id == section.id }), current.items.count > 1
+    else { return }
+    isCleaningDuplicates = true
+    defer { isCleaningDuplicates = false }
+    do {
+      for item in current.items { try await validateDuplicateItem(item) }
+      let ranked = try await rankDuplicateItems(current.items)
+      let kept = ranked[0]
+      let removals = Array(ranked.dropFirst())
+      for item in removals {
+        let capability = await fileOperations.capabilities(for: .media(item), in: folder)
+        guard capability.canModify else { throw FileOperationRepositoryError.readOnlyDestination }
+        guard capability.canMoveToTrash else {
+          throw FileOperationRepositoryError.unsupportedOperation(
+            "Trash isn’t available for these pictures. No copies were removed.")
+        }
+      }
+      await executeDuplicateCleanup(DuplicateCleanupPlan(keptItem: kept, removals: removals))
+    } catch {
+      presentFileOperationError(title: "Couldn’t Remove Duplicates", error: error)
+    }
+  }
+
+  private func rankDuplicateItems(_ items: [MediaItem], useCache: Bool = false) async throws
+    -> [MediaItem]
+  {
+    var ranked: [(item: MediaItem, quality: DuplicateImageQuality)] = []
+    for item in items {
+      try Task.checkCancellation()
+      let quality: DuplicateImageQuality
+      if useCache, let cached = duplicateQualities[item] {
+        quality = cached
+      } else {
+        quality = try await fileOperations.imageQuality(for: item, in: folder)
+        duplicateQualities[item] = quality
+      }
+      ranked.append((item, quality))
+    }
+    return ranked.sorted { first, second in
+      let a = first.quality
+      let b = second.quality
+      if a.pixelCount != b.pixelCount { return a.pixelCount > b.pixelCount }
+      if a.bitDepth != b.bitDepth { return a.bitDepth > b.bitDepth }
+      if a.isLossless != b.isLossless { return a.isLossless }
+      if a.fileSize != b.fileSize { return a.fileSize > b.fileSize }
+      return first.item.relativePath < second.item.relativePath
+    }.map(\.item)
+  }
+
+  private func updatePreferredDuplicates() {
+    let sections = isShowingDuplicates ? mediaSections : []
+    guard sections != rankedSections else { return }
+    duplicateRankingTask?.cancel()
+    let unchangedIDs = Set(
+      sections.filter { rankedSections.contains($0) }.flatMap(\.items).map(\.id))
+    preferredDuplicateIDs.formIntersection(unchangedIDs)
+    rankedSections = sections
+    let items = Set(sections.flatMap(\.items))
+    duplicateQualities = duplicateQualities.filter { items.contains($0.key) }
+    duplicateRankingTask = Task { [weak self] in
+      guard let self else { return }
+      for section in sections {
+        guard !Task.isCancelled else { return }
+        guard let best = try? await self.rankDuplicateItems(section.items, useCache: true).first,
+          !Task.isCancelled, self.rankedSections == sections
+        else { continue }
+        self.preferredDuplicateIDs.insert(best.id)
+      }
+    }
+  }
+
+  private func validateDuplicateItem(_ item: MediaItem) async throws {
+    let info = try await fileOperations.info(for: .media(item), in: folder)
+    guard info.modificationDate == item.modificationDate, info.fileSize == item.fileSize else {
+      throw FileOperationRepositoryError.unsupportedOperation(
+        "The pictures changed. Wait for the duplicate scan to refresh and try again.")
+    }
+  }
+
+  private func executeDuplicateCleanup(_ plan: DuplicateCleanupPlan) async {
+    // An in-flight scan may still contain the files we are about to trash.
+    duplicateScanTask?.cancel()
+    duplicateScanTask = nil
+    duplicateScanID = nil
+    isScanningDuplicates = false
+    isMutatingDuplicateFiles = true
+    defer {
+      isMutatingDuplicateFiles = false
+      startDuplicateScan(invalidate: true, after: fileChangeRefreshDelay)
+      startPeopleScan(invalidate: true, after: fileChangeRefreshDelay)
+      scheduleRefresh()
+    }
+    do {
+      for item in [plan.keptItem] + plan.removals { try await validateDuplicateItem(item) }
+      for item in plan.removals {
+        try Task.checkCancellation()
+        try await validateDuplicateItem(plan.keptItem)
+        try await validateDuplicateItem(item)
+        try await fileOperations.moveToTrash(.media(item), in: folder)
+        removeTrashedDuplicateFromResults(item.id)
+      }
+    } catch {
+      presentFileOperationError(title: "Couldn’t Remove Duplicates", error: error)
+    }
+  }
+
+  private func removeTrashedDuplicateFromResults(_ id: MediaItem.ID) {
+    guard case .success(let snapshot) = duplicateScanResult else { return }
+    let sections = snapshot.sections.compactMap { section -> MediaSection? in
+      let remaining = section.items.filter { $0.id != id }
+      guard remaining.count > 1 else { return nil }
+      return MediaSection(id: section.id, title: section.title, items: remaining)
+    }
+    let updated = MediaBrowserSnapshot(
+      folderTree: snapshot.folderTree, selectedFolder: nil,
+      mediaItems: [], sections: sections)
+    duplicateScanResult = .success(updated)
+    duplicateGroupCount = sections.count
+    if isShowingDuplicates { applyDuplicateProgress(updated) }
   }
 
   func copy(_ target: FileOperationTarget) async {
@@ -340,7 +655,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   }
 
   func revealInFolder(_ item: MediaItem) async {
-    guard selectedDestination == .recents else { return }
+    guard selectedFolder == nil else { return }
     let destination = MediaBrowserDestination.folder(
       MediaFolder.ID(url: item.id.url.deletingLastPathComponent().standardizedFileURL)
     )
@@ -401,12 +716,12 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
         MediaTransfer(sources: sources, destination: destination, operation: operation),
         in: folder
       )
-      await refresh(after: fileChangeRefreshDelay)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
     } catch is CancellationError {
-      await refresh(after: fileChangeRefreshDelay)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
       return
     } catch {
-      await refresh(after: fileChangeRefreshDelay)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
       alertTitle = "Couldn’t Transfer Media"
       alertMessage = error.localizedDescription
     }
@@ -515,13 +830,38 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
         in: folder
       )
       viewerMode = nil
-      await refresh(after: fileChangeRefreshDelay)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
       isSavingViewerMode = false
       if let item = mediaItemsByID[MediaItem.ID(url: resultURL.standardizedFileURL)] {
         await activateMedia(item)
       }
     } catch {
       presentFileOperationError(title: "Couldn’t Crop Picture", error: error)
+    }
+  }
+
+  func rotatePictureClockwise() async {
+    guard
+      !isSavingViewerMode,
+      viewerMode == nil,
+      case .picture(let picture) = openedMedia,
+      fileOperationCapabilities[picture.item.id.url.standardizedFileURL]?.canModify == true
+    else {
+      return
+    }
+
+    isSavingViewerMode = true
+    defer { isSavingViewerMode = false }
+    do {
+      let resultURL = try await fileOperations.rotatePictureClockwise(picture.item, in: folder)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
+      isSavingViewerMode = false
+      if let item = mediaItemsByID[MediaItem.ID(url: resultURL.standardizedFileURL)] {
+        await activateMedia(item)
+        await loadFileOperationCapabilities(for: .media(item))
+      }
+    } catch {
+      presentFileOperationError(title: "Couldn’t Rotate Picture", error: error)
     }
   }
 
@@ -536,7 +876,187 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     alertMessage = nil
   }
 
-  private func refresh(after delay: Duration = .zero, showsLoading: Bool = false) async {
+  private func mergingDuplicateProgress(_ snapshot: MediaBrowserSnapshot) -> MediaBrowserSnapshot {
+    guard case .success(let previous) = duplicateScanResult else { return snapshot }
+    var sections = previous.sections
+    for incoming in snapshot.sections {
+      let incomingIDs = Set(incoming.items.map(\.id))
+      let matchingIndices = sections.indices.filter { index in
+        sections[index].items.contains { incomingIDs.contains($0.id) }
+      }
+      guard let firstIndex = matchingIndices.first else {
+        sections.append(incoming)
+        continue
+      }
+      // Keep not-yet-revisited members until the completed scan provides an authoritative result.
+      let incomingByID = Dictionary(uniqueKeysWithValues: incoming.items.map { ($0.id, $0) })
+      let retained = matchingIndices.flatMap { sections[$0].items }.map {
+        incomingByID[$0.id] ?? $0
+      }
+      let retainedIDs = Set(retained.map(\.id))
+      let items = retained + incoming.items.filter { !retainedIDs.contains($0.id) }
+      sections[firstIndex] = MediaSection(
+        id: sections[firstIndex].id, title: incoming.title, items: items)
+      for index in matchingIndices.dropFirst().reversed() { sections.remove(at: index) }
+    }
+    return MediaBrowserSnapshot(
+      folderTree: snapshot.folderTree, selectedFolder: nil,
+      mediaItems: [], sections: sections)
+  }
+
+  private func startDuplicateScan(invalidate: Bool = false, after delay: Duration = .zero) {
+    guard !isMutatingDuplicateFiles else { return }
+    if duplicateScanTask != nil {
+      if invalidate { needsDuplicateScan = true }
+      return
+    }
+    guard invalidate || duplicateScanResult == nil else { return }
+    let scanID = UUID()
+    duplicateScanID = scanID
+    isScanningDuplicates = true
+    let repository = mediaRepository
+    let rootFolder = folder
+    duplicateScanTask = Task { [weak self] in
+      do {
+        if delay > .zero { try await Task.sleep(for: delay) }
+        guard let self else { return }
+        repeat {
+          self.needsDuplicateScan = false
+          let result: Result<MediaBrowserSnapshot, any Error>
+          do {
+            var latest: MediaBrowserSnapshot?
+            for try await snapshot in await repository.duplicateSnapshots(
+              in: rootFolder, sort: self.mediaSort)
+            {
+              try Task.checkCancellation()
+              guard self.duplicateScanID == scanID else { return }
+              latest = snapshot
+              // A queued follow-up scan must not silence this scan's incremental results.
+              // Do not erase existing results or badges with an empty partial scan.
+              if !snapshot.mediaItems.isEmpty || self.duplicateScanResult == nil {
+                let progress = self.mergingDuplicateProgress(snapshot)
+                self.duplicateScanResult = .success(progress)
+                self.duplicateGroupCount = max(self.duplicateGroupCount, progress.sections.count)
+                if self.isShowingDuplicates {
+                  self.applyDuplicateProgress(progress)
+                }
+              }
+            }
+            guard let latest else { throw CancellationError() }
+            result = .success(latest)
+          } catch is CancellationError {
+            throw CancellationError()
+          } catch {
+            result = .failure(error)
+          }
+          try Task.checkCancellation()
+          guard self.duplicateScanID == scanID else { return }
+          // Changes during a scan require a fresh result before clearing the badge.
+          if !self.needsDuplicateScan {
+            self.duplicateScanResult = result
+            if case .success(let snapshot) = result {
+              self.duplicateGroupCount = snapshot.sections.count
+            }
+          }
+        } while self.needsDuplicateScan
+        self.duplicateScanTask = nil
+        self.isScanningDuplicates = false
+        if self.isShowingDuplicates && !self.isReadingSnapshot {
+          self.scheduleRefresh()
+        }
+      } catch {
+        guard let self, self.duplicateScanID == scanID else { return }
+        self.duplicateScanTask = nil
+        self.isScanningDuplicates = false
+      }
+    }
+  }
+
+  private func startPeopleScan(invalidate: Bool = false, after delay: Duration = .zero) {
+    if peopleScanTask != nil {
+      if invalidate { needsPeopleScan = true }
+      return
+    }
+    guard invalidate || peopleScanID == nil else { return }
+    let scanID = UUID()
+    peopleScanID = scanID
+    isScanningPeople = true
+    peopleErrorMessage = nil
+    let repository = peopleRepository
+    let root = folder
+    peopleScanTask = Task { [weak self] in
+      do {
+        if delay > .zero { try await Task.sleep(for: delay) }
+        guard let self else { return }
+        repeat {
+          self.needsPeopleScan = false
+          self.peopleErrorMessage = nil
+          var latest: [PersonGroup] = []
+          do {
+            for try await groups in await repository.people(in: root) {
+              try Task.checkCancellation()
+              guard self.peopleScanID == scanID else { return }
+              latest = groups
+              // Keep the previous scan's albums until the replacement scan is complete.
+              for group in groups {
+                if case .person(let id) = self.selectedDestination,
+                  group.mergedGroupIDs.contains(id)
+                {
+                  self.selectedDestination = .person(group.id)
+                }
+                self.people.removeAll { group.mergedGroupIDs.contains($0.id) }
+                if let index = self.people.firstIndex(where: { $0.id == group.id }) {
+                  let previous = self.people[index]
+                  let ids = Set(group.items.map(\.id))
+                  self.people[index] = PersonGroup(
+                    id: group.id, name: group.name,
+                    thumbnail: group.thumbnail,
+                    items: group.items + previous.items.filter { !ids.contains($0.id) },
+                    mergedGroupIDs: group.mergedGroupIDs)
+                } else {
+                  self.people.append(group)
+                }
+              }
+              self.applyPeopleResults()
+            }
+            try Task.checkCancellation()
+            guard self.peopleScanID == scanID else { return }
+            if !self.needsPeopleScan { self.people = latest }
+          } catch is CancellationError { throw CancellationError() } catch {
+            self.peopleErrorMessage = error.localizedDescription
+          }
+        } while self.needsPeopleScan
+        self.peopleScanTask = nil
+        self.isScanningPeople = false
+        self.applyPeopleResults()
+      } catch {
+        guard let self, self.peopleScanID == scanID else { return }
+        self.peopleScanTask = nil
+        self.isScanningPeople = false
+      }
+    }
+  }
+
+  private func applyPeopleResults() {
+    guard case .person(let id) = selectedDestination, refreshTask == nil,
+      let folderTree
+    else { return }
+    apply(
+      MediaBrowserSnapshot(
+        folderTree: folderTree, selectedFolder: nil,
+        mediaItems: people.first { $0.id == id }?.items ?? []), sequence: refreshSequence)
+  }
+
+  private func refresh(
+    after delay: Duration = .zero,
+    showsLoading: Bool = false,
+    rescanDuplicates: Bool = false
+  ) async {
+    if rescanDuplicates {
+      startDuplicateScan(invalidate: true, after: delay)
+      startPeopleScan(invalidate: true, after: delay)
+      startPersonSearch(after: delay)
+    }
     let task = scheduleRefresh(after: delay, showsLoading: showsLoading)
     await withTaskCancellationHandler {
       await task.value
@@ -546,6 +1066,10 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   }
 
   private func scheduleFileChangeRefresh() {
+    guard !isMutatingDuplicateFiles else { return }
+    startDuplicateScan(invalidate: true, after: fileChangeRefreshDelay)
+    startPeopleScan(invalidate: true, after: fileChangeRefreshDelay)
+    startPersonSearch(after: fileChangeRefreshDelay)
     if refreshTask != nil {
       if isReadingSnapshot { needsRefreshAfterCurrent = true }
       return
@@ -566,6 +1090,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     if showsLoading { isLoading = true }
 
     let destination = selectedDestination
+    let showsDuplicates = isShowingDuplicates
     let sort = mediaSort
     let repository = mediaRepository
     let rootFolder = folder
@@ -576,11 +1101,47 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
         }
         guard let self, self.refreshSequence == sequence else { return }
         self.isReadingSnapshot = true
-        let snapshot = try await repository.snapshot(
-          of: rootFolder,
-          destination: destination,
-          sort: sort
-        )
+        let snapshot: MediaBrowserSnapshot
+        if showsDuplicates {
+          self.startDuplicateScan()
+          if self.duplicateScanResult == nil { await self.duplicateScanTask?.value }
+          let currentFolderTree: MediaFolder? =
+            if case .folder = destination {
+              try await repository.snapshot(
+                of: rootFolder, destination: destination, sort: sort
+              ).folderTree
+            } else {
+              nil
+            }
+          try Task.checkCancellation()
+          guard let result = self.duplicateScanResult else { throw CancellationError() }
+          let duplicates = try result.get()
+          if let currentFolderTree {
+            snapshot = MediaBrowserSnapshot(
+              folderTree: currentFolderTree, selectedFolder: nil,
+              mediaItems: [], sections: duplicates.sections)
+          } else {
+            snapshot = duplicates
+          }
+        } else {
+          let base = try await repository.snapshot(
+            of: rootFolder,
+            destination: destination,
+            sort: sort
+          )
+          if case .person(let id) = destination {
+            self.startPeopleScan()
+            snapshot = MediaBrowserSnapshot(
+              folderTree: base.folderTree, selectedFolder: nil,
+              mediaItems: self.people.first { $0.id == id }?.items ?? [])
+          } else if destination == .personSearch {
+            snapshot = MediaBrowserSnapshot(
+              folderTree: base.folderTree, selectedFolder: nil, mediaItems: self.personSearchItems)
+          } else {
+            if destination == .people { self.startPeopleScan() }
+            snapshot = base
+          }
+        }
         try Task.checkCancellation()
         guard self.refreshSequence == sequence else { return }
         self.apply(snapshot, sequence: sequence)
@@ -596,27 +1157,75 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     return task
   }
 
+  private func applyDuplicateProgress(_ snapshot: MediaBrowserSnapshot) {
+    if showsFolderDuplicates, case .folder(let id) = selectedDestination,
+      selectedFolder?.id != id
+    {
+      return
+    }
+    // A scan's folder tree may predate the current sidebar selection.
+    let current = MediaBrowserSnapshot(
+      folderTree: showsFolderDuplicates ? (folderTree ?? snapshot.folderTree) : snapshot.folderTree,
+      selectedFolder: nil, mediaItems: [], sections: snapshot.sections)
+    apply(current, sequence: refreshSequence)
+  }
+
   private func apply(_ snapshot: MediaBrowserSnapshot, sequence: Int) {
+    let snapshot =
+      if showsFolderDuplicates, case .folder(let id) = selectedDestination {
+        mediaRepository.folderDuplicateSnapshot(from: snapshot, in: id)
+      } else {
+        snapshot
+      }
     folderTree = snapshot.folderTree
     selectedFolder = snapshot.selectedFolder
     if let selectedFolder = snapshot.selectedFolder {
       selectedDestination = .folder(selectedFolder.id)
       selectedDestinationName = selectedFolder.name
+    } else if selectedDestination == .duplicates {
+      selectedDestinationName = "Duplicates"
+    } else if case .person(let id) = selectedDestination {
+      if let person = people.first(where: { $0.id == id }) {
+        selectedDestinationName = person.name
+      } else if !isScanningPeople {
+        selectedDestination = .people
+        selectedDestinationName = "People"
+      }
+    } else if selectedDestination == .people {
+      selectedDestinationName = "People"
+    } else if selectedDestination == .personSearch {
+      selectedDestinationName = "Search for person"
     } else {
+      showsFolderDuplicates = false
       selectedDestination = .recents
       selectedDestinationName = "Recents"
     }
+    mediaSections = snapshot.sections
+    updatePreferredDuplicates()
     mediaItems = snapshot.mediaItems
     mediaItemsByID = snapshot.mediaItemsByID
     mediaItemsRevision &+= 1
+    let openMediaCapability = openedMedia.flatMap { media in
+      snapshot.mediaItemsByID[media.item.id].flatMap { _ in
+        fileOperationCapabilities[media.item.id.url.standardizedFileURL]
+      }
+    }
     fileOperationCapabilities.removeAll()
+    if let openedMedia, let openMediaCapability {
+      fileOperationCapabilities[openedMedia.item.id.url.standardizedFileURL] = openMediaCapability
+    }
     errorMessage = nil
 
     if let selectedMediaID, snapshot.mediaItemsByID[selectedMediaID] == nil {
       self.selectedMediaID = nil
     }
-    mediaThumbnails = mediaThumbnails.filter { snapshot.mediaItemsByID[$0.key] != nil }
-    loadedThumbnailItems = loadedThumbnailItems.filter { snapshot.mediaItemsByID[$0.key] != nil }
+    mediaThumbnails = mediaThumbnails.filter {
+      guard let current = snapshot.mediaItemsByID[$0.key] else { return false }
+      return loadedThumbnailItems[$0.key] == current
+    }
+    loadedThumbnailItems = loadedThumbnailItems.filter {
+      snapshot.mediaItemsByID[$0.key] == $0.value
+    }
     thumbnailLoadIDs = thumbnailLoadIDs.filter { snapshot.mediaItemsByID[$0.key] != nil }
     if let openedMedia, snapshot.mediaItemsByID[openedMedia.item.id] == nil {
       self.openedMedia = nil
@@ -627,6 +1236,8 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   }
 
   private func applyRefreshError(_ error: any Error, sequence: Int) {
+    mediaSections = []
+    updatePreferredDuplicates()
     mediaItems = []
     mediaItemsByID = [:]
     mediaItemsRevision &+= 1
@@ -647,7 +1258,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     isLoading = false
     if needsRefreshAfterCurrent {
       needsRefreshAfterCurrent = false
-      scheduleFileChangeRefresh()
+      scheduleRefresh(after: fileChangeRefreshDelay)
     }
   }
 
@@ -700,9 +1311,10 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
           resultURL.map {
             .folder(MediaFolder.ID(url: $0.standardizedFileURL))
           } ?? .recents
+        if resultURL == nil { showsFolderDuplicates = false }
       }
 
-      await refresh(after: fileChangeRefreshDelay)
+      await refresh(after: fileChangeRefreshDelay, rescanDuplicates: true)
       if selectsResult, let resultURL,
         let item = mediaItems.first(where: {
           $0.id.url.standardizedFileURL == resultURL.standardizedFileURL

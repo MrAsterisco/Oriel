@@ -7,6 +7,170 @@ import UniformTypeIdentifiers
 
 struct MediaRepositoryTests {
   @Test
+  func folderDuplicatesFilterMembershipKeepGroupIdentityAndOmitLocalSingletons() {
+    let url = URL(fileURLWithPath: "/Library")
+    let child = MediaFolder(
+      id: .init(url: url.appending(path: "A")), name: "A", path: "/Library/A", children: nil)
+    let tree = MediaFolder(
+      id: .init(url: url), name: "Library", path: url.path, children: [child])
+    let items = ["B/1.jpg", "A/1.jpg", "A/2.jpg", "A/Nested/3.jpg", "A/solo.jpg", "B/solo.jpg"]
+      .map { item(path: $0, dateAdded: nil, fileSize: nil) }
+    let group = MediaSection(id: items[0].id, title: "Mixed folders", items: Array(items.prefix(4)))
+    let singleton = MediaSection(id: items[4].id, title: "Singleton", items: Array(items.suffix(2)))
+    let snapshot = MediaBrowserSnapshot(
+      folderTree: tree, selectedFolder: nil, mediaItems: [], sections: [group, singleton])
+    let filtered = LocalMediaRepository().folderDuplicateSnapshot(from: snapshot, in: child.id)
+    #expect(filtered.folderTree == tree)
+    #expect(filtered.selectedFolder == child)
+    #expect(filtered.sections.count == 1)
+    #expect(filtered.sections.first?.id == group.id)
+    #expect(filtered.sections.first?.title == "A · Group 1 · 2 Pictures")
+    #expect(filtered.mediaItems == Array(items[1...2]))
+    #expect(
+      filtered.mediaItemsByID
+        == Dictionary(
+          uniqueKeysWithValues: items[1...2].map {
+            ($0.id, $0)
+          }))
+    let missing = LocalMediaRepository().folderDuplicateSnapshot(
+      from: snapshot, in: .init(url: url.appending(path: "Deleted")))
+    #expect(missing.selectedFolder == tree)
+    #expect(missing.mediaItems.isEmpty)
+    #expect(snapshot.sections == [group, singleton])
+  }
+
+  @Test
+  func pixelVerificationRejectsLocalChangesAndDifferentFraming() {
+    let pixels = [UInt8](repeating: 128, count: 64 * 64 * 4)
+    let original = DuplicateImageSample(aspectRatio: 1, pixels: pixels)
+    let recompressed = DuplicateImageSample(aspectRatio: 1, pixels: pixels.map { $0 + 2 })
+    #expect(LocalMediaRepository.matchingDuplicatePixels(original, recompressed))
+    var changed = pixels
+    for y in 16..<24 {
+      for x in 16..<24 {
+        for channel in 0..<3 { changed[(y * 64 + x) * 4 + channel] = 180 }
+      }
+    }
+    #expect(
+      !LocalMediaRepository.matchingDuplicatePixels(
+        original, DuplicateImageSample(aspectRatio: 1, pixels: changed)))
+    #expect(
+      !LocalMediaRepository.matchingDuplicatePixels(
+        original, DuplicateImageSample(aspectRatio: 1.2, pixels: pixels)))
+  }
+
+  @Test
+  func groupingPublishesMatchesBeforeProcessingTheRemainingPictures() throws {
+    let items = ["a.jpg", "b.jpg", "c.jpg"].map { item(path: $0, dateAdded: nil, fileSize: nil) }
+    var processed: [Int] = []
+    var updates: [[MediaItem]] = []
+    _ = try LocalMediaRepository.duplicateGroups(
+      items, prepare: { processed.append($0) },
+      onUpdate: { groups in
+        if updates.isEmpty { #expect(processed == [0, 1]) }
+        updates.append(groups[0])
+      }, matches: { _, _ in true }
+    )
+    #expect(updates.map(\.count) == [2, 3])
+  }
+
+  @Test
+  func duplicateGroupsExcludeSingletonsAndDoNotChainSimilarImages() throws {
+    let items = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"].map {
+      item(path: $0, dateAdded: nil, fileSize: nil)
+    }
+    let groups = try LocalMediaRepository.duplicateGroups(items) { first, second in
+      Set([first, second]) == [0, 1]
+        || Set([first, second]) == [1, 2]
+        || Set([first, second]) == [3, 4]
+    }
+    #expect(groups.map { $0.map(\.name) } == [["a.jpg", "b.jpg"], ["d.jpg", "e.jpg"]])
+    #expect(try LocalMediaRepository.duplicateGroups([]) { _, _ in true }.isEmpty)
+  }
+
+  @Test
+  func duplicatesUseVisionAcrossSubfoldersAndRefreshAfterRemoval() async throws {
+    let rootURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    let nestedURL = rootURL.appending(path: "Nested")
+    try FileManager.default.createDirectory(at: nestedURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: rootURL) }
+    let originalURL = rootURL.appending(path: "original.png")
+    let copyURL = nestedURL.appending(path: "copy.jpg")
+    try writeDuplicateFixture(to: originalURL, variant: false)
+    try writeDuplicateFixture(to: copyURL, variant: false)
+    try writeDuplicateFixture(to: rootURL.appending(path: "different.png"), variant: true)
+    try Data().write(to: rootURL.appending(path: "video.mov"))
+    let folder = Folder(id: Folder.ID(), name: "Test", path: rootURL.path, url: rootURL)
+    let repository = LocalMediaRepository()
+    let snapshot = try await repository.snapshot(
+      of: folder, destination: .duplicates, sort: .initial)
+    #expect(snapshot.selectedFolder == nil)
+    #expect(snapshot.sections.count == 1)
+    #expect(snapshot.sections.first?.title == "Nested, Test · Group 1 · 2 Pictures")
+    #expect(Set(snapshot.mediaItems.map(\.relativePath)) == ["original.png", "Nested/copy.jpg"])
+    #expect(snapshot.sections.flatMap(\.items) == snapshot.mediaItems)
+    let operations = LocalFileOperationRepository()
+    let png = try #require(snapshot.mediaItems.first { $0.id.url == originalURL })
+    let jpeg = try #require(snapshot.mediaItems.first { $0.id.url == copyURL })
+    let pngQuality = try await operations.imageQuality(for: png, in: folder)
+    let jpegQuality = try await operations.imageQuality(for: jpeg, in: folder)
+    #expect(pngQuality.pixelCount == 256 * 256)
+    #expect(pngQuality.bitDepth == 8)
+    #expect(pngQuality.isLossless)
+    #expect(!jpegQuality.isLossless)
+
+    try FileManager.default.removeItem(at: copyURL)
+    let refreshed = try await repository.snapshot(
+      of: folder, destination: .duplicates, sort: .initial)
+    #expect(refreshed.mediaItems.isEmpty)
+    #expect(refreshed.sections.isEmpty)
+  }
+
+  @Test
+  func duplicateScanReportsUnreadablePicturesInsteadOfClaimingNoMatches() async throws {
+    let rootURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: rootURL) }
+    try Data().write(to: rootURL.appending(path: "broken.jpg"))
+    let folder = Folder(id: Folder.ID(), name: "Test", path: rootURL.path, url: rootURL)
+    do {
+      _ = try await LocalMediaRepository().snapshot(
+        of: folder, destination: .duplicates, sort: .initial)
+      Issue.record("Expected the unreadable image to be reported")
+    } catch MediaRepositoryError.duplicateAnalysisFailed(let name, _) {
+      #expect(name == "broken.jpg")
+    }
+  }
+
+  private func writeDuplicateFixture(to url: URL, variant: Bool) throws {
+    let context = try #require(
+      CGContext(
+        data: nil, width: 256, height: 256, bitsPerComponent: 8, bytesPerRow: 1024,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      ))
+    context.setFillColor(CGColor(gray: variant ? 1 : 0.2, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 256, height: 256))
+    for index in 0..<12 {
+      context.setFillColor(
+        CGColor(
+          red: CGFloat(index % 3) / 2, green: CGFloat(index % 5) / 4,
+          blue: variant ? 0 : 1, alpha: 1
+        ))
+      let rect = CGRect(x: index * 19, y: (index * 37) % 220, width: 35, height: 35)
+      if variant { context.fillEllipse(in: rect) } else { context.fill(rect) }
+    }
+    let image = try #require(context.makeImage())
+    let type = url.pathExtension == "jpg" ? UTType.jpeg : UTType.png
+    let destination = try #require(
+      CGImageDestinationCreateWithURL(
+        url as CFURL, type.identifier as CFString, 1, nil
+      ))
+    CGImageDestinationAddImage(destination, image, nil)
+    #expect(CGImageDestinationFinalize(destination))
+  }
+
+  @Test
   func recursivelyLoadsSupportedMediaAndSortsItByDateThenPath() async throws {
     let rootURL = FileManager.default.temporaryDirectory
       .appending(path: UUID().uuidString, directoryHint: .isDirectory)

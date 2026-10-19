@@ -63,3 +63,15 @@ nonisolated struct FileItemInfo: Identifiable, Hashable, Sendable {
   let duration: TimeInterval?
   let location: String
 }
+
+nonisolated struct DuplicateImageQuality: Equatable, Sendable {
+  let pixelCount: Int64
+  let bitDepth: Int
+  let isLossless: Bool
+  let fileSize: Int64
+}
+
+nonisolated struct DuplicateCleanupPlan: Sendable {
+  let keptItem: MediaItem
+  let removals: [MediaItem]
+}

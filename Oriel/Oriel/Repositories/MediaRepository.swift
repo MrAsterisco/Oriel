@@ -3,6 +3,7 @@ import ImageIO
 import Nuke
 import QuickLookThumbnailing
 import UniformTypeIdentifiers
+import Vision
 
 #if os(macOS)
   import AppKit
@@ -16,6 +17,12 @@ nonisolated protocol MediaRepository: Sendable {
     destination: MediaBrowserDestination,
     sort: MediaSort
   ) async throws -> MediaBrowserSnapshot
+  func duplicateSnapshots(
+    in rootFolder: Folder, sort: MediaSort
+  ) async -> AsyncThrowingStream<MediaBrowserSnapshot, any Error>
+  func folderDuplicateSnapshot(
+    from snapshot: MediaBrowserSnapshot, in folderID: MediaFolder.ID
+  ) -> MediaBrowserSnapshot
   func recentMedia(in rootFolder: Folder) async throws -> [MediaItem]
   func thumbnail(for item: MediaItem) async throws -> MediaThumbnail
   func picture(for item: MediaItem) async throws -> PictureContent
@@ -23,7 +30,58 @@ nonisolated protocol MediaRepository: Sendable {
   func updates(in folder: Folder) async -> AsyncStream<Void>
 }
 
+extension MediaRepository {
+  func folderDuplicateSnapshot(
+    from snapshot: MediaBrowserSnapshot, in folderID: MediaFolder.ID
+  ) -> MediaBrowserSnapshot {
+    let folder = Self.findFolder(folderID, in: snapshot.folderTree) ?? snapshot.folderTree
+    let folderComponents = folder.id.url.standardizedFileURL.pathComponents
+    let groups = snapshot.sections.compactMap { section -> MediaSection? in
+      let items = section.items.filter {
+        $0.id.url.deletingLastPathComponent().standardizedFileURL.pathComponents == folderComponents
+      }
+      guard items.count > 1 else { return nil }
+      return MediaSection(id: section.id, title: section.title, items: items)
+    }
+    let sections = groups.enumerated().map { index, section in
+      MediaSection(
+        id: section.id,
+        title: "\(folder.name) · Group \(index + 1) · \(section.items.count) Pictures",
+        items: section.items)
+    }
+    return MediaBrowserSnapshot(
+      folderTree: snapshot.folderTree, selectedFolder: folder, mediaItems: [], sections: sections)
+  }
+
+  nonisolated fileprivate static func findFolder(
+    _ id: MediaFolder.ID,
+    in folder: MediaFolder
+  ) -> MediaFolder? {
+    if folder.id == id { return folder }
+    for child in folder.children ?? [] {
+      if let match = findFolder(id, in: child) { return match }
+    }
+    return nil
+  }
+
+  func duplicateSnapshots(
+    in rootFolder: Folder, sort: MediaSort
+  ) async -> AsyncThrowingStream<MediaBrowserSnapshot, any Error> {
+    AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          continuation.yield(
+            try await snapshot(of: rootFolder, destination: .duplicates, sort: sort))
+          continuation.finish()
+        } catch { continuation.finish(throwing: error) }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+}
+
 nonisolated enum MediaRepositoryError: LocalizedError, Sendable {
+  case duplicateAnalysisFailed(String, String)
   case invalidPicture
   case invalidTransferDestination
   case invalidTransferSource(String)
@@ -34,6 +92,8 @@ nonisolated enum MediaRepositoryError: LocalizedError, Sendable {
 
   var errorDescription: String? {
     switch self {
+    case .duplicateAnalysisFailed(let name, let message):
+      "Couldn’t analyze \(name): \(message)"
     case .invalidPicture:
       "This file isn’t a supported picture."
     case .invalidTransferDestination:
@@ -73,6 +133,14 @@ actor LocalMediaRepository: MediaRepository {
     destination: MediaBrowserDestination,
     sort: MediaSort
   ) async throws -> MediaBrowserSnapshot {
+    if destination == .duplicates {
+      var result: MediaBrowserSnapshot?
+      for try await snapshot in await duplicateSnapshots(in: rootFolder, sort: sort) {
+        result = snapshot
+      }
+      guard let result else { throw CancellationError() }
+      return result
+    }
     return try await Self.performFileIO {
       let fileManager = FileManager()
       let folderTree = try Self.makeFolderTree(
@@ -94,6 +162,11 @@ actor LocalMediaRepository: MediaRepository {
           ),
           by: .initial
         )
+      case .duplicates:
+        preconditionFailure("Duplicates are handled by the streaming scan")
+      case .people, .person, .personSearch:
+        selectedFolder = nil
+        mediaItems = []
       case .folder(let id):
         let folder = Self.findFolder(id, in: folderTree) ?? folderTree
         selectedFolder = folder
@@ -113,6 +186,158 @@ actor LocalMediaRepository: MediaRepository {
         mediaItems: mediaItems
       )
     }
+  }
+
+  func duplicateSnapshots(
+    in rootFolder: Folder, sort: MediaSort
+  ) async -> AsyncThrowingStream<MediaBrowserSnapshot, any Error> {
+    AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+      let task = Task.detached(priority: .utility) {
+        do {
+          let fileManager = FileManager()
+          let tree = try Self.makeFolderTree(
+            at: rootFolder.url, requiresAccess: true, fileManager: fileManager)
+          let pictures = try Self.makeMediaItemsRecursively(
+            in: rootFolder.url, relativeTo: rootFolder.url, fileManager: fileManager
+          ).filter { $0.kind == .picture }.sorted { $0.relativePath < $1.relativePath }
+          let publish: ([[MediaItem]]) -> Void = { groups in
+            let sections = groups.enumerated().map { index, items in
+              let folders = Set(
+                items.map { item in
+                  let parent = item.id.url.deletingLastPathComponent().standardizedFileURL
+                  return parent == rootFolder.url.standardizedFileURL
+                    ? rootFolder.name : parent.lastPathComponent
+                }
+              ).sorted().joined(separator: ", ")
+              return MediaSection(
+                id: items[0].id, title: "\(folders) · Group \(index + 1) · \(items.count) Pictures",
+                items: Self.sortMediaItems(items, by: sort))
+            }
+            continuation.yield(
+              MediaBrowserSnapshot(
+                folderTree: tree, selectedFolder: nil, mediaItems: [], sections: sections
+              ))
+          }
+          publish([])
+          var prints: [VNFeaturePrintObservation] = []
+          var samples: [DuplicateImageSample] = []
+          let groups = try Self.duplicateGroups(
+            pictures,
+            prepare: { index in
+              let item = pictures[index]
+              do {
+                let print = try autoreleasepool {
+                  let image = try Self.downsampleImage(at: item.id.url, maxPixelSize: 512)
+                  samples.append(try Self.duplicateImageSample(image))
+                  let request = VNGenerateImageFeaturePrintRequest()
+                  request.revision = VNGenerateImageFeaturePrintRequestRevision2
+                  request.imageCropAndScaleOption = .scaleFit
+                  try VNImageRequestHandler(cgImage: image).perform([request])
+                  guard let result = request.results?.first else {
+                    throw MediaRepositoryError.invalidPicture
+                  }
+                  return result
+                }
+                prints.append(print)
+              } catch is CancellationError { throw CancellationError() } catch {
+                throw MediaRepositoryError.duplicateAnalysisFailed(
+                  item.relativePath, error.localizedDescription)
+              }
+            }, onUpdate: publish
+          ) { first, second in
+            var distance: Float = 0
+            try prints[first].computeDistance(&distance, to: prints[second])
+            // Vision finds similar scenes; pixel agreement distinguishes copies from different shots.
+            return distance <= 0.4 && Self.matchingDuplicatePixels(samples[first], samples[second])
+          }
+          try Task.checkCancellation()
+          publish(groups)
+          continuation.finish()
+        } catch { continuation.finish(throwing: error) }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  nonisolated static func duplicateImageSample(_ image: CGImage) throws -> DuplicateImageSample {
+    let size = 64
+    var pixels = [UInt8](repeating: 0, count: size * size * 4)
+    try pixels.withUnsafeMutableBytes { bytes in
+      guard
+        let context = CGContext(
+          data: bytes.baseAddress, width: size, height: size, bitsPerComponent: 8,
+          bytesPerRow: size * 4,
+          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+          bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+            | CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+      else { throw MediaRepositoryError.invalidPicture }
+      context.interpolationQuality = .high
+      context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+    }
+    return DuplicateImageSample(
+      aspectRatio: Double(image.width) / Double(image.height), pixels: pixels)
+  }
+
+  nonisolated static func matchingDuplicatePixels(
+    _ first: DuplicateImageSample, _ second: DuplicateImageSample
+  ) -> Bool {
+    guard abs(first.aspectRatio / second.aspectRatio - 1) <= 0.005 else { return false }
+    var totalDifference = 0
+    for blockY in 0..<8 {
+      for blockX in 0..<8 {
+        var blockDifference = 0
+        for y in (blockY * 8)..<(blockY * 8 + 8) {
+          for x in (blockX * 8)..<(blockX * 8 + 8) {
+            for channel in 0..<4 {
+              let index = (y * 64 + x) * 4 + channel
+              blockDifference += abs(Int(first.pixels[index]) - Int(second.pixels[index]))
+            }
+          }
+        }
+        // Local agreement prevents changed faces or poses from disappearing in a global average.
+        guard Double(blockDifference) / (8 * 8 * 4 * 255) <= 0.04 else { return false }
+        totalDifference += blockDifference
+      }
+    }
+    return Double(totalDifference) / (64 * 64 * 4 * 255) <= 0.015
+  }
+
+  nonisolated static func duplicateGroups(
+    _ pictures: [MediaItem],
+    prepare: (Int) throws -> Void = { _ in },
+    onUpdate: ([[MediaItem]]) -> Void = { _ in },
+    matches: (Int, Int) throws -> Bool
+  ) throws -> [[MediaItem]] {
+    // shortcut: Pairwise matching is quadratic; index feature prints if large-library scans become slow.
+    var groups: [[Int]] = []
+    for index in pictures.indices {
+      try Task.checkCancellation()
+      try prepare(index)
+      var matchingGroup: Int?
+      for groupIndex in groups.indices {
+        // Require every pair to match, avoiding chains that group unrelated endpoints.
+        var matchesGroup = true
+        for member in groups[groupIndex] {
+          try Task.checkCancellation()
+          if try !matches(index, member) {
+            matchesGroup = false
+            break
+          }
+        }
+        if matchesGroup {
+          matchingGroup = groupIndex
+          break
+        }
+      }
+      if let matchingGroup {
+        groups[matchingGroup].append(index)
+        onUpdate(groups.filter { $0.count > 1 }.map { $0.map { pictures[$0] } })
+      } else {
+        groups.append([index])
+      }
+    }
+    return groups.filter { $0.count > 1 }.map { $0.map { pictures[$0] } }
   }
 
   func recentMedia(in rootFolder: Folder) async throws -> [MediaItem] {
@@ -302,9 +527,10 @@ actor LocalMediaRepository: MediaRepository {
   }
 
   nonisolated private static func performFileIO<Result: Sendable>(
+    priority: TaskPriority = .userInitiated,
     _ operation: @escaping @Sendable () throws -> Result
   ) async throws -> Result {
-    let task = Task.detached(priority: .userInitiated, operation: operation)
+    let task = Task.detached(priority: priority, operation: operation)
     return try await withTaskCancellationHandler {
       try await task.value
     } onCancel: {
@@ -549,17 +775,6 @@ actor LocalMediaRepository: MediaRepository {
     return components.starts(with: rootComponents)
   }
 
-  nonisolated private static func findFolder(
-    _ id: MediaFolder.ID,
-    in folder: MediaFolder
-  ) -> MediaFolder? {
-    if folder.id == id { return folder }
-    for child in folder.children ?? [] {
-      if let match = findFolder(id, in: child) { return match }
-    }
-    return nil
-  }
-
   private func loadImage(for item: MediaItem, maxPixelSize: Float) async throws -> MediaImage {
     var request = ImageRequest(url: item.id.url)
     request.imageID = cacheID(for: item)
@@ -581,27 +796,7 @@ actor LocalMediaRepository: MediaRepository {
     }
 
     let result = try await Self.performFileIO {
-      try Task.checkCancellation()
-      guard
-        let source = CGImageSourceCreateWithURL(
-          item.id.url as CFURL,
-          [kCGImageSourceShouldCache: false] as CFDictionary
-        ),
-        let image = CGImageSourceCreateThumbnailAtIndex(
-          source,
-          0,
-          [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-          ] as CFDictionary
-        )
-      else {
-        throw MediaRepositoryError.thumbnailUnavailable
-      }
-      try Task.checkCancellation()
-      return MediaImage(cgImage: image)
+      MediaImage(cgImage: try Self.downsampleImage(at: item.id.url, maxPixelSize: maxPixelSize))
     }
 
     #if os(macOS)
@@ -614,6 +809,32 @@ actor LocalMediaRepository: MediaRepository {
     #endif
     imagePipeline.cache[request] = ImageContainer(image: image)
     return result
+  }
+
+  nonisolated private static func downsampleImage(at url: URL, maxPixelSize: Float) throws
+    -> CGImage
+  {
+    try Task.checkCancellation()
+    guard
+      let source = CGImageSourceCreateWithURL(
+        url as CFURL,
+        [kCGImageSourceShouldCache: false] as CFDictionary
+      ),
+      let image = CGImageSourceCreateThumbnailAtIndex(
+        source,
+        0,
+        [
+          kCGImageSourceCreateThumbnailFromImageAlways: true,
+          kCGImageSourceCreateThumbnailWithTransform: true,
+          kCGImageSourceShouldCacheImmediately: true,
+          kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ] as CFDictionary
+      )
+    else {
+      throw MediaRepositoryError.thumbnailUnavailable
+    }
+    try Task.checkCancellation()
+    return image
   }
 
   private func cacheID(for item: MediaItem) -> String {

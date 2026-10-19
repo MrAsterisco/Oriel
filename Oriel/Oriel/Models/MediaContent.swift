@@ -16,6 +16,10 @@ nonisolated struct MediaFolder: Identifiable, Hashable, Sendable {
 
 nonisolated enum MediaBrowserDestination: Hashable, Sendable {
   case recents
+  case duplicates
+  case people
+  case person(PersonGroup.ID)
+  case personSearch
   case folder(MediaFolder.ID)
 }
 
@@ -189,20 +193,37 @@ nonisolated struct MediaImage: Sendable {
   let cgImage: CGImage
 }
 
+nonisolated struct MediaSection: Identifiable, Equatable, Sendable {
+  let id: MediaItem.ID
+  let title: String?
+  let items: [MediaItem]
+}
+
 nonisolated struct MediaBrowserSnapshot: Sendable {
   let folderTree: MediaFolder
   let selectedFolder: MediaFolder?
   let mediaItems: [MediaItem]
   let mediaItemsByID: [MediaItem.ID: MediaItem]
+  let sections: [MediaSection]
 
   init(
     folderTree: MediaFolder,
     selectedFolder: MediaFolder?,
-    mediaItems: [MediaItem]
+    mediaItems: [MediaItem],
+    sections: [MediaSection]? = nil
   ) {
     self.folderTree = folderTree
     self.selectedFolder = selectedFolder
-    self.mediaItems = mediaItems
-    mediaItemsByID = Dictionary(uniqueKeysWithValues: mediaItems.map { ($0.id, $0) })
+    self.mediaItems = sections?.flatMap(\.items) ?? mediaItems
+    self.sections =
+      sections ?? mediaItems.first.map {
+        [MediaSection(id: $0.id, title: nil, items: mediaItems)]
+      } ?? []
+    mediaItemsByID = Dictionary(uniqueKeysWithValues: self.mediaItems.map { ($0.id, $0) })
   }
+}
+
+nonisolated struct DuplicateImageSample: Sendable {
+  let aspectRatio: Double
+  let pixels: [UInt8]
 }
