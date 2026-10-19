@@ -119,13 +119,14 @@ actor LocalMediaRepository: MediaRepository {
   )
   private static let thumbnailMaxPixelSize: Float = 480
 
-  private let imagePipeline: ImagePipeline
+  private let imageCache: any ImageCaching
   private var presenters: [UUID: FolderChangePresenter] = [:]
+  private var duplicateScans: [URL: (pictures: [MediaItem], groups: [[MediaItem]])] = [:]
 
   init(
-    imagePipeline: ImagePipeline = .shared
+    imageCache: any ImageCaching = ImageCache(costLimit: 64 * 1024 * 1024, countLimit: 256)
   ) {
-    self.imagePipeline = imagePipeline
+    self.imageCache = imageCache
   }
 
   func snapshot(
@@ -167,6 +168,22 @@ actor LocalMediaRepository: MediaRepository {
       case .people, .person, .personSearch:
         selectedFolder = nil
         mediaItems = []
+      case .folders(let ids):
+        let folders = ids.compactMap { Self.findFolder($0, in: folderTree) }
+          .sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
+          }
+        let sections = try folders.map { folder in
+          MediaSection(
+            id: MediaItem.ID(url: folder.id.url), title: folder.name,
+            items: Self.sortMediaItems(
+              try Self.makeMediaItems(
+                in: folder.id.url, relativeTo: rootFolder.url, fileManager: fileManager),
+              by: sort))
+        }
+        return MediaBrowserSnapshot(
+          folderTree: folderTree, selectedFolder: nil, mediaItems: [], sections: sections)
       case .folder(let id):
         let folder = Self.findFolder(id, in: folderTree) ?? folderTree
         selectedFolder = folder
@@ -191,8 +208,9 @@ actor LocalMediaRepository: MediaRepository {
   func duplicateSnapshots(
     in rootFolder: Folder, sort: MediaSort
   ) async -> AsyncThrowingStream<MediaBrowserSnapshot, any Error> {
-    AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-      let task = Task.detached(priority: .utility) {
+    let cachedScan = duplicateScans[rootFolder.url]
+    return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+      let task = Task.detached(priority: .background) {
         do {
           let fileManager = FileManager()
           let tree = try Self.makeFolderTree(
@@ -218,45 +236,82 @@ actor LocalMediaRepository: MediaRepository {
                 folderTree: tree, selectedFolder: nil, mediaItems: [], sections: sections
               ))
           }
+          try Task.checkCancellation()
+          if let cachedScan, cachedScan.pictures == pictures {
+            publish(cachedScan.groups)
+            continuation.finish()
+            return
+          }
           publish([])
-          var prints: [VNFeaturePrintObservation] = []
+          var prints: [Int: VNFeaturePrintObservation] = [:]
           var samples: [DuplicateImageSample] = []
+          func featurePrint(at index: Int) throws -> VNFeaturePrintObservation {
+            if let cached = prints[index] { return cached }
+            let item = pictures[index]
+            do {
+              let result = try autoreleasepool {
+                let image = try Self.downsampleImage(at: item.id.url, maxPixelSize: 512)
+                let request = VNGenerateImageFeaturePrintRequest()
+                request.revision = VNGenerateImageFeaturePrintRequestRevision2
+                request.imageCropAndScaleOption = .scaleFit
+                request.preferBackgroundProcessing = true
+                try VNImageRequestHandler(cgImage: image).perform([request])
+                guard let result = request.results?.first else {
+                  throw MediaRepositoryError.invalidPicture
+                }
+                return result
+              }
+              prints[index] = result
+              return result
+            } catch is CancellationError { throw CancellationError() } catch {
+              throw MediaRepositoryError.duplicateAnalysisFailed(
+                item.relativePath, error.localizedDescription)
+            }
+          }
           let groups = try Self.duplicateGroups(
             pictures,
+            minimumUpdateInterval: .milliseconds(250),
             prepare: { index in
               let item = pictures[index]
               do {
-                let print = try autoreleasepool {
-                  let image = try Self.downsampleImage(at: item.id.url, maxPixelSize: 512)
-                  samples.append(try Self.duplicateImageSample(image))
-                  let request = VNGenerateImageFeaturePrintRequest()
-                  request.revision = VNGenerateImageFeaturePrintRequestRevision2
-                  request.imageCropAndScaleOption = .scaleFit
-                  try VNImageRequestHandler(cgImage: image).perform([request])
-                  guard let result = request.results?.first else {
-                    throw MediaRepositoryError.invalidPicture
-                  }
-                  return result
-                }
-                prints.append(print)
+                samples.append(
+                  try autoreleasepool {
+                    let image = try Self.downsampleImage(at: item.id.url, maxPixelSize: 512)
+                    return try Self.duplicateImageSample(image)
+                  })
               } catch is CancellationError { throw CancellationError() } catch {
                 throw MediaRepositoryError.duplicateAnalysisFailed(
                   item.relativePath, error.localizedDescription)
               }
             }, onUpdate: publish
           ) { first, second in
-            var distance: Float = 0
-            try prints[first].computeDistance(&distance, to: prints[second])
-            // Vision finds similar scenes; pixel agreement distinguishes copies from different shots.
-            return distance <= 0.4 && Self.matchingDuplicatePixels(samples[first], samples[second])
+            try Self.matchingDuplicates(samples[first], samples[second]) {
+              var distance: Float = 0
+              try featurePrint(at: first).computeDistance(&distance, to: featurePrint(at: second))
+              return distance
+            }
           }
           try Task.checkCancellation()
+          await self.cacheDuplicateScan(pictures: pictures, groups: groups, in: rootFolder.url)
           publish(groups)
           continuation.finish()
         } catch { continuation.finish(throwing: error) }
       }
       continuation.onTermination = { _ in task.cancel() }
     }
+  }
+
+  private func cacheDuplicateScan(pictures: [MediaItem], groups: [[MediaItem]], in root: URL) {
+    duplicateScans[root] = (pictures, groups)
+  }
+
+  nonisolated static func matchingDuplicates(
+    _ first: DuplicateImageSample, _ second: DuplicateImageSample,
+    featureDistance: () throws -> Float
+  ) throws -> Bool {
+    // Pixel agreement is required either way; reject distinct shots before running Vision.
+    guard matchingDuplicatePixels(first, second) else { return false }
+    return try featureDistance() <= 0.4
   }
 
   nonisolated static func duplicateImageSample(_ image: CGImage) throws -> DuplicateImageSample {
@@ -283,6 +338,14 @@ actor LocalMediaRepository: MediaRepository {
     _ first: DuplicateImageSample, _ second: DuplicateImageSample
   ) -> Bool {
     guard abs(first.aspectRatio / second.aspectRatio - 1) <= 0.005 else { return false }
+    // The absolute difference of sums is a lower bound on the sum of pixel differences.
+    var minimumDifference = 0
+    for (firstSum, secondSum) in zip(first.blockSums, second.blockSums) {
+      let difference = abs(firstSum - secondSum)
+      guard Double(difference) / (8 * 8 * 4 * 255) <= 0.04 else { return false }
+      minimumDifference += difference
+    }
+    guard Double(minimumDifference) / (64 * 64 * 4 * 255) <= 0.015 else { return false }
     var totalDifference = 0
     for blockY in 0..<8 {
       for blockX in 0..<8 {
@@ -305,12 +368,14 @@ actor LocalMediaRepository: MediaRepository {
 
   nonisolated static func duplicateGroups(
     _ pictures: [MediaItem],
+    minimumUpdateInterval: Duration = .zero,
     prepare: (Int) throws -> Void = { _ in },
     onUpdate: ([[MediaItem]]) -> Void = { _ in },
     matches: (Int, Int) throws -> Bool
   ) throws -> [[MediaItem]] {
-    // shortcut: Pairwise matching is quadratic; index feature prints if large-library scans become slow.
+    // shortcut: Candidate checks remain quadratic; index pixel samples if comparisons dominate scans.
     var groups: [[Int]] = []
+    var nextUpdate = ContinuousClock.now
     for index in pictures.indices {
       try Task.checkCancellation()
       try prepare(index)
@@ -332,7 +397,10 @@ actor LocalMediaRepository: MediaRepository {
       }
       if let matchingGroup {
         groups[matchingGroup].append(index)
-        onUpdate(groups.filter { $0.count > 1 }.map { $0.map { pictures[$0] } })
+        if ContinuousClock.now >= nextUpdate {
+          onUpdate(groups.filter { $0.count > 1 }.map { $0.map { pictures[$0] } })
+          nextUpdate = ContinuousClock.now.advanced(by: minimumUpdateInterval)
+        }
       } else {
         groups.append([index])
       }
@@ -341,7 +409,7 @@ actor LocalMediaRepository: MediaRepository {
   }
 
   func recentMedia(in rootFolder: Folder) async throws -> [MediaItem] {
-    return try await Self.performFileIO {
+    return try await Self.performFileIO(priority: Task.currentPriority) {
       let fileManager = FileManager()
       return Self.sortMediaItems(
         try Self.makeMediaItemsRecursively(
@@ -780,7 +848,8 @@ actor LocalMediaRepository: MediaRepository {
     request.imageID = cacheID(for: item)
     request.thumbnail = ImageRequest.ThumbnailOptions(maxPixelSize: maxPixelSize)
 
-    if let image = imagePipeline.cache[request]?.image {
+    let key = ImageCacheKey(request: request)
+    if let image = imageCache[key]?.image {
       #if os(macOS)
         var rect = CGRect(origin: .zero, size: image.size)
         guard let cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
@@ -807,7 +876,7 @@ actor LocalMediaRepository: MediaRepository {
     #else
       let image = UIImage(cgImage: result.cgImage)
     #endif
-    imagePipeline.cache[request] = ImageContainer(image: image)
+    imageCache[key] = ImageContainer(image: image)
     return result
   }
 

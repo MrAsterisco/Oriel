@@ -20,6 +20,7 @@
     let sections: [MediaSection]
     let preferredDuplicateIDs: Set<MediaItem.ID>
     let isCleaningDuplicates: Bool
+    let showsDuplicateActions: Bool
     let onKeepBestCopy: (MediaSection) -> Void
     let itemsByID: [MediaItem.ID: MediaItem]
     let itemsRevision: Int
@@ -222,6 +223,7 @@
         forRepresentedObjectAt indexPath: IndexPath
       ) {
         guard let mediaItem = mediaItem(at: indexPath) else { return }
+        if let cell = item as? MediaCollectionItem { configure(cell, with: mediaItem) }
         loadThumbnailIfNeeded(for: mediaItem)
       }
 
@@ -248,7 +250,10 @@
         didEndDisplaying item: NSCollectionViewItem,
         forRepresentedObjectAt indexPath: IndexPath
       ) {
-        guard let mediaItem = (item as? MediaCollectionItem)?.mediaItem else { return }
+        guard let cell = item as? MediaCollectionItem, let mediaItem = cell.mediaItem else {
+          return
+        }
+        cell.releaseImage()
         // Diffable updates can replace a cell while its media item remains on screen.
         Task { @MainActor [weak self, weak collectionView] in
           guard let self, let collectionView else { return }
@@ -301,17 +306,20 @@
           MediaSectionHeading(
             title: section.title ?? "",
             isCleaningDuplicates: parent.isCleaningDuplicates,
+            showsDuplicateActions: parent.showsDuplicateActions,
             onKeepBestCopy: { [weak self] in self?.parent.onKeepBestCopy(section) }))
       }
 
       func updateVisibleItems(in collectionView: NSCollectionView) {
-        for index in parent.sections.indices {
-          if let header = collectionView.supplementaryView(
-            forElementKind: NSCollectionView.elementKindSectionHeader,
-            at: IndexPath(item: 0, section: index)
-          ) as? MediaSectionHeader {
-            configure(header, section: parent.sections[index])
-          }
+        for indexPath in collectionView.indexPathsForVisibleSupplementaryElements(
+          ofKind: NSCollectionView.elementKindSectionHeader)
+        {
+          guard parent.sections.indices.contains(indexPath.section),
+            let header = collectionView.supplementaryView(
+              forElementKind: NSCollectionView.elementKindSectionHeader, at: indexPath)
+              as? MediaSectionHeader
+          else { continue }
+          configure(header, section: parent.sections[indexPath.section])
         }
         for collectionItem in collectionView.visibleItems() {
           guard let indexPath = collectionView.indexPath(for: collectionItem),
@@ -561,7 +569,7 @@
     }
   }
 
-  private final class MediaCollectionItem: NSCollectionViewItem {
+  final class MediaCollectionItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("MediaCollectionItem")
 
     private var hostingView: NSHostingView<MediaCell>?
@@ -584,12 +592,27 @@
     func configure(item: MediaItem, thumbnail: MediaThumbnail?, isPreferredDuplicate: Bool) {
       let itemChanged = mediaItem != item
       let thumbnailChanged = self.thumbnail?.image.cgImage !== thumbnail?.image.cgImage
-      guard itemChanged || thumbnailChanged || self.isPreferredDuplicate != isPreferredDuplicate
+      guard
+        hostingView == nil || itemChanged || thumbnailChanged
+          || self.isPreferredDuplicate != isPreferredDuplicate
       else { return }
       self.isPreferredDuplicate = isPreferredDuplicate
       mediaItem = item
       self.thumbnail = thumbnail
       updateContent()
+    }
+
+    override func prepareForReuse() {
+      super.prepareForReuse()
+      releaseImage()
+      mediaItem = nil
+    }
+
+    func releaseImage() {
+      guard thumbnail != nil else { return }
+      thumbnail = nil
+      updateContent()
+      hostingView?.layoutSubtreeIfNeeded()
     }
 
     private func updateContent() {

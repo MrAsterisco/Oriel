@@ -141,6 +141,7 @@ struct MediaBrowserView: View {
               }
             }
           }
+
         }
     }
     .task { await model.run() }
@@ -208,7 +209,7 @@ struct MediaBrowserView: View {
 
   @ViewBuilder
   private var folderSidebar: some View {
-    List(selection: selectedDestination) {
+    List(selection: sidebarSelection) {
       Label("Recents", systemImage: "clock")
         .tag(MediaBrowserDestination.recents)
       Label("Duplicates", systemImage: "square.on.square")
@@ -234,6 +235,9 @@ struct MediaBrowserView: View {
         }
       }
     }
+    #if !os(macOS)
+      .toolbar { EditButton() }
+    #endif
   }
 
   @ViewBuilder
@@ -291,7 +295,10 @@ struct MediaBrowserView: View {
         people: model.people, isScanning: model.isScanningPeople,
         errorMessage: model.peopleErrorMessage,
         onOpen: { person in Task { await model.selectDestination(.person(person.id)) } },
-        onRetry: { Task { await model.retry() } })
+        onRetry: { Task { await model.retry() } },
+        thumbnails: model.faceThumbnails,
+        onLoadThumbnail: { await model.loadFaceThumbnail($0) },
+        onDiscardThumbnail: { model.discardFaceThumbnail($0) })
     } else {
       VStack(spacing: 0) {
         if model.selectedDestination == .personSearch {
@@ -299,7 +306,10 @@ struct MediaBrowserView: View {
             faces: model.personSearchFaces, selectedIndex: model.personSearchFaceIndex,
             isSearching: model.isSearchingPerson, errorMessage: model.personSearchErrorMessage,
             onSelect: { model.selectPersonSearchFace(at: $0) },
-            onRetry: { Task { await model.retry() } })
+            onRetry: { Task { await model.retry() } },
+            thumbnails: model.faceThumbnails,
+            onLoadThumbnail: { await model.loadFaceThumbnail($0) },
+            onDiscardThumbnail: { model.discardFaceThumbnail($0) })
           Divider()
         }
         if case .person = model.selectedDestination {
@@ -358,7 +368,7 @@ struct MediaBrowserView: View {
       ContentUnavailableView(
         "Looking for Duplicates", systemImage: "square.on.square",
         description: Text("Matching pictures will appear here as they’re found."))
-    } else if model.mediaItems.isEmpty {
+    } else if model.mediaItems.isEmpty && !model.isShowingMultipleFolders {
       if model.selectedDestination == .personSearch {
         ContentUnavailableView(
           model.isSearchingPerson
@@ -397,6 +407,7 @@ struct MediaBrowserView: View {
         sections: model.mediaSections,
         preferredDuplicateIDs: model.preferredDuplicateIDs,
         isCleaningDuplicates: model.isCleaningDuplicates,
+        showsDuplicateActions: model.isShowingDuplicates,
         onKeepBestCopy: { section in Task { await model.keepBestCopy(in: section) } },
         itemsByID: model.mediaItemsByID,
         itemsRevision: model.mediaItemsRevision,
@@ -438,6 +449,7 @@ struct MediaBrowserView: View {
                 MediaSectionHeading(
                   title: title,
                   isCleaningDuplicates: model.isCleaningDuplicates,
+                  showsDuplicateActions: model.isShowingDuplicates,
                   onKeepBestCopy: { Task { await model.keepBestCopy(in: section) } }
                 )
                 .padding()
@@ -695,6 +707,13 @@ struct MediaBrowserView: View {
     let isRoot = folder.id == model.folderTree?.id
 
     Group {
+      if model.canMergeSelectedFolders,
+        model.sidebarSelection.contains(.folder(folder.id))
+      {
+        Button("Merge Selected Folders", systemImage: "folder.badge.plus") {
+          Task { await model.mergeSelectedFolders() }
+        }
+      }
       Button("Open", systemImage: "folder") {
         Task { await model.selectDestination(.folder(folder.id)) }
       }
@@ -871,16 +890,10 @@ struct MediaBrowserView: View {
     }
   #endif
 
-  private var selectedDestination: Binding<MediaBrowserDestination?> {
+  private var sidebarSelection: Binding<Set<MediaBrowserDestination>> {
     Binding(
-      get: {
-        if isPeopleAlbum { return .people }
-        return model.selectedDestination
-      },
-      set: { destination in
-        guard let destination else { return }
-        Task { await model.selectDestination(destination) }
-      }
+      get: { model.sidebarSelection },
+      set: { destinations in Task { await model.selectSidebarDestinations(destinations) } }
     )
   }
 
@@ -1288,18 +1301,21 @@ extension View {
 struct MediaSectionHeading: View {
   let title: String
   let isCleaningDuplicates: Bool
+  let showsDuplicateActions: Bool
   let onKeepBestCopy: () -> Void
 
   var body: some View {
     HStack {
       Text(title).font(.headline).lineLimit(1).truncationMode(.middle)
       Spacer()
-      Button("Keep Best Copy", action: onKeepBestCopy)
-        .controlSize(.small)
-        .disabled(isCleaningDuplicates)
-        .help(
-          "Keep the highest resolution, then greatest bit depth, lossless format, and largest file. Move other copies to Trash."
-        )
+      if showsDuplicateActions {
+        Button("Keep Best Copy", action: onKeepBestCopy)
+          .controlSize(.small)
+          .disabled(isCleaningDuplicates)
+          .help(
+            "Keep the highest resolution, then greatest bit depth, lossless format, and largest file. Move other copies to Trash."
+          )
+      }
     }
   }
 }

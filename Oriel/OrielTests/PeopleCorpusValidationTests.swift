@@ -1,9 +1,78 @@
 import Foundation
+import ImageIO
 import Testing
+import Vision
 
 @testable import Oriel
 
+@Suite(.serialized)
 struct PeopleCorpusValidationTests {
+  @Test(
+    .enabled(
+      if: ProcessInfo.processInfo.environment["ORIEL_PEOPLE_CORPUS"] != nil,
+      "Set ORIEL_PEOPLE_CORPUS to an explicitly prepared public validation corpus."))
+  func duplicateScanMatchesTheEagerVisionBaseline() async throws {
+    let path = try #require(ProcessInfo.processInfo.environment["ORIEL_PEOPLE_CORPUS"])
+    let root = Folder(
+      id: Folder.ID(), name: "Public Corpus", path: path, url: URL(fileURLWithPath: path))
+    let media = LocalMediaRepository()
+    let pictures = try await media.recentMedia(in: root)
+      .filter { $0.kind == .picture }.sorted { $0.relativePath < $1.relativePath }
+    let baselineStart = ContinuousClock.now
+    let baseline = try await Task.detached(priority: .background) {
+      var prints: [VNFeaturePrintObservation] = []
+      var samples: [DuplicateImageSample] = []
+      return try LocalMediaRepository.duplicateGroups(
+        pictures,
+        prepare: { index in
+          try autoreleasepool {
+            let source = try #require(
+              CGImageSourceCreateWithURL(pictures[index].id.url as CFURL, nil))
+            let image = try #require(
+              CGImageSourceCreateThumbnailAtIndex(
+                source, 0,
+                [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 512,
+                  kCGImageSourceShouldCacheImmediately: true,
+                ] as CFDictionary))
+            samples.append(try LocalMediaRepository.duplicateImageSample(image))
+            let request = VNGenerateImageFeaturePrintRequest()
+            request.revision = VNGenerateImageFeaturePrintRequestRevision2
+            request.imageCropAndScaleOption = .scaleFit
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            prints.append(try #require(request.results?.first))
+          }
+        }
+      ) { first, second in
+        var distance: Float = 0
+        try prints[first].computeDistance(&distance, to: prints[second])
+        return distance <= 0.4
+          && LocalMediaRepository.matchingDuplicatePixels(samples[first], samples[second])
+      }
+    }.value
+    let baselineDuration = baselineStart.duration(to: .now)
+    let scanStart = ContinuousClock.now
+    let snapshot = try await media.snapshot(of: root, destination: .duplicates, sort: .initial)
+    let scanDuration = scanStart.duration(to: .now)
+    let cachedStart = ContinuousClock.now
+    let cached = try await media.snapshot(of: root, destination: .duplicates, sort: .initial)
+    let cachedDuration = cachedStart.duration(to: .now)
+    #expect(
+      snapshot.sections.map { Set($0.items.map(\.id)) } == baseline.map { Set($0.map(\.id)) })
+    #expect(cached.sections == snapshot.sections)
+    let report: [String: Any] = [
+      "pictureCount": pictures.count, "duplicateGroupCount": snapshot.sections.count,
+      "eagerVisionDuration": baselineDuration.description,
+      "pixelFirstDuration": scanDuration.description,
+      "unchangedScanDuration": cachedDuration.description,
+    ]
+    try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+      .write(
+        to: FileManager.default.temporaryDirectory.appending(path: "oriel-scan-performance.json"))
+  }
+
   @Test(
     .enabled(
       if: ProcessInfo.processInfo.environment["ORIEL_PEOPLE_CORPUS"] != nil,

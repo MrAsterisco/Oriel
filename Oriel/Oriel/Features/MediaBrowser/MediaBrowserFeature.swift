@@ -18,6 +18,9 @@ protocol MediaBrowserFeatureModelProtocol: AnyObject, Observable {
   var isShowingDuplicates: Bool { get }
   var isScanningPeople: Bool { get }
   var people: [PersonGroup] { get }
+  var faceThumbnails: [FaceThumbnailSource.ID: MediaThumbnail] { get }
+  func loadFaceThumbnail(_ source: FaceThumbnailSource) async
+  func discardFaceThumbnail(_ source: FaceThumbnailSource)
   var peopleErrorMessage: String? { get }
   var personSearchFaces: [DetectedFace] { get }
   var personSearchFaceIndex: Int? { get }
@@ -44,6 +47,11 @@ protocol MediaBrowserFeatureModelProtocol: AnyObject, Observable {
   var mediaThumbnails: [MediaItem.ID: MediaThumbnail] { get }
   var openedMedia: OpenedMedia? { get }
   var panOffset: CGSize { get }
+  var sidebarSelection: Set<MediaBrowserDestination> { get }
+  var isShowingMultipleFolders: Bool { get }
+  var canMergeSelectedFolders: Bool { get }
+  func selectSidebarDestinations(_ destinations: Set<MediaBrowserDestination>) async
+  func mergeSelectedFolders() async
   var selectedDestination: MediaBrowserDestination { get }
   var selectedDestinationName: String { get }
   var selectedFolder: MediaFolder? { get }
@@ -110,6 +118,7 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private let folderAccess: any FolderAccessRepository
   private let mediaRepository: any MediaRepository
   private let peopleRepository: any PeopleRepository
+  private var isMergingFolders = false
   private let fileChangeRefreshDelay: Duration
   private var isObserving = false
   private var isReadingSnapshot = false
@@ -136,6 +145,8 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
   private var needsPeopleScan = false
   private(set) var isScanningPeople = false
   private(set) var people: [PersonGroup] = []
+  private(set) var faceThumbnails: [FaceThumbnailSource.ID: MediaThumbnail] = [:]
+  private var faceThumbnailLoadIDs: [FaceThumbnailSource.ID: UUID] = [:]
   private(set) var peopleErrorMessage: String?
   private var personSearchTask: Task<Void, Never>?
   private var personSearchID: UUID?
@@ -237,8 +248,85 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
     await refresh(showsLoading: true, rescanDuplicates: true)
   }
 
+  var sidebarSelection: Set<MediaBrowserDestination> {
+    if case .folders(let ids) = selectedDestination { return Set(ids.map { .folder($0) }) }
+    if case .person = selectedDestination { return [.people] }
+    if selectedDestination == .personSearch { return [.people] }
+    return [selectedDestination]
+  }
+
+  private var selectedFolders: [MediaFolder] {
+    guard case .folders(let ids) = selectedDestination, let folderTree else { return [] }
+    func collect(_ folder: MediaFolder) -> [MediaFolder] {
+      (ids.contains(folder.id) ? [folder] : []) + (folder.children ?? []).flatMap(collect)
+    }
+    return collect(folderTree).sorted {
+      let order = $0.name.localizedStandardCompare($1.name)
+      return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
+    }
+  }
+
+  var isShowingMultipleFolders: Bool {
+    if case .folders = selectedDestination { return true }
+    return false
+  }
+
+  var canMergeSelectedFolders: Bool {
+    let folders = selectedFolders
+    guard !isMergingFolders, folders.count > 1 else { return false }
+    return folders.allSatisfy { candidate in
+      guard candidate.id != folderTree?.id,
+        let capabilities = fileOperationCapabilities[candidate.id.url.standardizedFileURL],
+        capabilities.canModifyContents, capabilities.canMoveToTrash
+      else { return false }
+      return !folders.contains { other in
+        other.id != candidate.id
+          && candidate.id.url.standardizedFileURL.pathComponents
+            .starts(with: other.id.url.standardizedFileURL.pathComponents)
+      }
+    }
+  }
+
+  func selectSidebarDestinations(_ destinations: Set<MediaBrowserDestination>) async {
+    guard !destinations.isEmpty else { return }
+    let added = destinations.subtracting(sidebarSelection)
+    let addedFolder = added.contains { if case .folder = $0 { true } else { false } }
+    let aggregates: [MediaBrowserDestination] = [.recents, .duplicates, .people]
+    if !addedFolder, let aggregate = aggregates.first(where: { added.contains($0) }) {
+      await selectDestination(aggregate)
+      return
+    }
+    let ids = Set(
+      destinations.compactMap { destination -> MediaFolder.ID? in
+        if case .folder(let id) = destination { return id }
+        return nil
+      })
+    if ids.count > 1 {
+      await selectDestination(.folders(ids))
+    } else if let id = ids.first {
+      await selectDestination(.folder(id))
+    }
+  }
+
+  func mergeSelectedFolders() async {
+    guard canMergeSelectedFolders, let first = selectedFolders.first else { return }
+    let folders = selectedFolders
+    isMergingFolders = true
+    defer { isMergingFolders = false }
+    do {
+      try await fileOperations.merge(folders, in: folder)
+      await selectDestination(.folder(first.id))
+      await refresh(rescanDuplicates: true)
+    } catch {
+      await refresh(rescanDuplicates: true)
+      presentFileOperationError(title: "Couldn’t Merge Folders", error: error)
+    }
+  }
+
   func selectDestination(_ destination: MediaBrowserDestination) async {
     guard destination != selectedDestination else { return }
+    faceThumbnailLoadIDs.removeAll()
+    faceThumbnails.removeAll()
     if destination != .personSearch { cancelPersonSearch() }
     selectedDestination = destination
     switch destination {
@@ -381,6 +469,24 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
 
   func setFolderSearchText(_ text: String) {
     folderSearchText = text
+  }
+
+  func loadFaceThumbnail(_ source: FaceThumbnailSource) async {
+    guard faceThumbnails[source.id] == nil else { return }
+    let loadID = UUID()
+    faceThumbnailLoadIDs[source.id] = loadID
+    defer {
+      if faceThumbnailLoadIDs[source.id] == loadID { faceThumbnailLoadIDs[source.id] = nil }
+    }
+    guard let thumbnail = try? await peopleRepository.thumbnail(for: source),
+      !Task.isCancelled, faceThumbnailLoadIDs[source.id] == loadID
+    else { return }
+    faceThumbnails[source.id] = thumbnail
+  }
+
+  func discardFaceThumbnail(_ source: FaceThumbnailSource) {
+    faceThumbnailLoadIDs[source.id] = nil
+    faceThumbnails[source.id] = nil
   }
 
   func loadThumbnail(for item: MediaItem) async {
@@ -1179,9 +1285,21 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
       }
     folderTree = snapshot.folderTree
     selectedFolder = snapshot.selectedFolder
-    if let selectedFolder = snapshot.selectedFolder {
+    if case .folders = selectedDestination {
+      let ids = Set(selectedFolders.map(\.id))
+      selectedDestination = .folders(ids)
+      if ids.count == 1, let remaining = selectedFolders.first {
+        selectedFolder = remaining
+      } else if ids.isEmpty {
+        selectedDestination = .recents
+        Task { await self.refresh(showsLoading: true) }
+      }
+    }
+    if let selectedFolder {
       selectedDestination = .folder(selectedFolder.id)
       selectedDestinationName = selectedFolder.name
+    } else if case .folders = selectedDestination {
+      selectedDestinationName = "\(selectedFolders.count) Folders"
     } else if selectedDestination == .duplicates {
       selectedDestinationName = "Duplicates"
     } else if case .person(let id) = selectedDestination {
@@ -1215,6 +1333,9 @@ final class MediaBrowserFeatureModel: MediaBrowserFeatureModelProtocol {
       fileOperationCapabilities[openedMedia.item.id.url.standardizedFileURL] = openMediaCapability
     }
     errorMessage = nil
+    for selected in selectedFolders {
+      Task { await self.loadFileOperationCapabilities(for: .folder(selected)) }
+    }
 
     if let selectedMediaID, snapshot.mediaItemsByID[selectedMediaID] == nil {
       self.selectedMediaID = nil

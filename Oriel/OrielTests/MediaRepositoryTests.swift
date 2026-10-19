@@ -1,11 +1,73 @@
 import Foundation
 import ImageIO
+import Nuke
 import Testing
 import UniformTypeIdentifiers
 
 @testable import Oriel
 
 struct MediaRepositoryTests {
+  @Test
+  func decodedImageCacheStaysWithinItsBudgetAndRejectsLargeViewerImages() async throws {
+    let url = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let context = try #require(
+      CGContext(
+        data: nil, width: 1000, height: 500, bitsPerComponent: 8,
+        bytesPerRow: 4000, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let image = try #require(context.makeImage())
+    let cache = ImageCache(costLimit: 900_000, countLimit: 2)
+    cache.entryCostLimit = 1
+    let repository = LocalMediaRepository(imageCache: cache)
+    for index in 0..<4 {
+      let pictureURL = url.appending(path: "\(index).png")
+      let destination = try #require(
+        CGImageDestinationCreateWithURL(
+          pictureURL as CFURL, UTType.png.identifier as CFString, 1, nil))
+      CGImageDestinationAddImage(destination, image, nil)
+      #expect(CGImageDestinationFinalize(destination))
+      let media = MediaItem(
+        id: .init(url: pictureURL), name: pictureURL.lastPathComponent, kind: .picture,
+        dateAdded: nil, fileSize: nil, modificationDate: nil,
+        relativePath: pictureURL.lastPathComponent)
+      _ = try await repository.thumbnail(for: media)
+      #expect(cache.totalCount > 0)
+      #expect(cache.totalCost <= cache.costLimit)
+      #expect(cache.totalCount <= cache.countLimit)
+      let costBeforeViewer = cache.totalCost
+      _ = try await repository.picture(for: media)
+      #expect(cache.totalCost == costBeforeViewer)
+    }
+  }
+
+  @Test
+  func multipleFoldersHaveAlphabeticalNamedSectionsIncludingEmptyFolders() async throws {
+    let manager = FileManager.default
+    let url = manager.temporaryDirectory.appending(path: UUID().uuidString)
+    try manager.createDirectory(at: url, withIntermediateDirectories: true)
+    defer { try? manager.removeItem(at: url) }
+    let folders = ["Zulu", "Alpha", "Empty"].map {
+      url.appending(path: $0, directoryHint: .isDirectory)
+    }
+    for folder in folders {
+      try manager.createDirectory(at: folder, withIntermediateDirectories: false)
+    }
+    try Data().write(to: folders[0].appending(path: "z.jpg"))
+    try Data().write(to: folders[1].appending(path: "a.jpg"))
+    try Data().write(to: folders[1].appending(path: "ignored.txt"))
+    let root = Folder(id: .init(), name: "Root", path: url.path, url: url)
+    let repository = LocalMediaRepository()
+    let snapshot = try await repository.snapshot(
+      of: root, destination: .folders(Set(folders.map { .init(url: $0) })), sort: .initial)
+    #expect(snapshot.selectedFolder == nil)
+    #expect(snapshot.sections.map(\.title) == ["Alpha", "Empty", "Zulu"])
+    #expect(snapshot.sections.map { $0.items.count } == [1, 0, 1])
+    #expect(snapshot.mediaItems.map(\.name) == ["a.jpg", "z.jpg"])
+    #expect(snapshot.mediaItemsByID.count == 2)
+  }
+
   @Test
   func folderDuplicatesFilterMembershipKeepGroupIdentityAndOmitLocalSingletons() {
     let url = URL(fileURLWithPath: "/Library")
@@ -57,6 +119,61 @@ struct MediaRepositoryTests {
     #expect(
       !LocalMediaRepository.matchingDuplicatePixels(
         original, DuplicateImageSample(aspectRatio: 1.2, pixels: pixels)))
+  }
+
+  @Test
+  func duplicateVerificationSkipsVisionForRejectedPixelsAndStillRequiresItsDistance() throws {
+    let pixels = [UInt8](repeating: 128, count: 64 * 64 * 4)
+    let original = DuplicateImageSample(aspectRatio: 1, pixels: pixels)
+    let different = DuplicateImageSample(
+      aspectRatio: 1, pixels: [UInt8](repeating: 64, count: pixels.count))
+    var comparisons = 0
+    #expect(
+      try !LocalMediaRepository.matchingDuplicates(original, different) {
+        comparisons += 1
+        return 0
+      })
+    #expect(comparisons == 0)
+    for distance: Float in [0, 0.4, 0.401] {
+      #expect(
+        try LocalMediaRepository.matchingDuplicates(original, original) {
+          comparisons += 1
+          return distance
+        } == (distance <= 0.4))
+    }
+    #expect(comparisons == 3)
+    #expect(throws: CancellationError.self) {
+      try LocalMediaRepository.matchingDuplicates(original, original) { throw CancellationError() }
+    }
+  }
+
+  @Test
+  func pixelBoundsKeepRecompressionAndRejectChangesWithIdenticalBlockSums() {
+    let pixels = (0..<(64 * 64 * 4)).map { UInt8(100 + $0 % 50) }
+    let original = DuplicateImageSample(aspectRatio: 1, pixels: pixels)
+    #expect(
+      LocalMediaRepository.matchingDuplicatePixels(
+        original, DuplicateImageSample(aspectRatio: 1, pixels: pixels.map { $0 + 3 })))
+    var changed = pixels
+    // Opposing changes have identical block sums, so the full pixel check must still run.
+    for index in changed.indices {
+      changed[index] = pixels[index] + (index % 2 == 0 ? 50 : 0) - (index % 2 == 1 ? 50 : 0)
+    }
+    let sameSums = DuplicateImageSample(aspectRatio: 1, pixels: changed)
+    #expect(original.blockSums == sameSums.blockSums)
+    #expect(!LocalMediaRepository.matchingDuplicatePixels(original, sameSums))
+  }
+
+  @Test
+  func groupingThrottlesProgressWithoutDroppingFinalMatches() throws {
+    let items = (0..<100).map { item(path: "\($0).jpg", dateAdded: nil, fileSize: nil) }
+    var updates: [[[MediaItem]]] = []
+    let result = try LocalMediaRepository.duplicateGroups(
+      items, minimumUpdateInterval: .seconds(3600),
+      onUpdate: { updates.append($0) }, matches: { _, _ in true })
+    #expect(updates.count == 1)
+    #expect(updates.first?.first?.count == 2)
+    #expect(result == [items])
   }
 
   @Test
@@ -118,6 +235,23 @@ struct MediaRepositoryTests {
     #expect(pngQuality.bitDepth == 8)
     #expect(pngQuality.isLossless)
     #expect(!jpegQuality.isLossless)
+
+    var cached: [MediaBrowserSnapshot] = []
+    for try await update in await repository.duplicateSnapshots(
+      in: folder, sort: MediaSort(option: .name, direction: .ascending))
+    {
+      cached.append(update)
+    }
+    #expect(cached.count == 1)
+    #expect(cached.first?.mediaItems.map(\.name) == ["copy.jpg", "original.png"])
+
+    // Changed metadata invalidates the completed scan, even when the file still exists.
+    try writeDuplicateFixture(to: copyURL, variant: true)
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date(timeIntervalSinceNow: 60)], ofItemAtPath: copyURL.path)
+    let changed = try await repository.snapshot(
+      of: folder, destination: .duplicates, sort: .initial)
+    #expect(Set(changed.mediaItems.map(\.relativePath)) == ["different.png", "Nested/copy.jpg"])
 
     try FileManager.default.removeItem(at: copyURL)
     let refreshed = try await repository.snapshot(

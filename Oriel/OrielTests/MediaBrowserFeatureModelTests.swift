@@ -6,6 +6,78 @@ import Testing
 
 @MainActor
 struct MediaBrowserFeatureModelTests {
+  @Test
+  func faceThumbnailsLoadOnDemandAndReleaseWhenDiscarded() async throws {
+    let url = URL(fileURLWithPath: "/Pictures")
+    let root = Folder(id: .init(), name: "Pictures", path: url.path, url: url)
+    let tree = MediaFolder(id: .init(url: url), name: root.name, path: root.path, children: nil)
+    let repository = MutableTestMediaRepository(
+      snapshot: MediaBrowserSnapshot(folderTree: tree, selectedFolder: nil, mediaItems: []))
+    let model = MediaBrowserFeatureModel(
+      folder: root, mediaRepository: repository, peopleRepository: TestPeopleRepository(),
+      fileOperations: TestFileOperationRepository(), folderAccess: TestMediaFolderAccessRepository()
+    )
+    let source = testFaceThumbnailSource()
+    #expect(model.faceThumbnails.isEmpty)
+    await model.loadFaceThumbnail(source)
+    weak var image = model.faceThumbnails[source.id]?.image.cgImage
+    #expect(image != nil)
+    model.discardFaceThumbnail(source)
+    #expect(model.faceThumbnails.isEmpty)
+    #expect(image == nil)
+    await model.loadFaceThumbnail(source)
+    #expect(model.faceThumbnails[source.id] != nil)
+    await model.selectDestination(.people)
+    #expect(model.faceThumbnails.isEmpty)
+  }
+
+  @Test
+  func sidebarMultipleSelectionClearsMediaAndKeepsAggregateDestinationsExclusive() async throws {
+    let url = URL(fileURLWithPath: "/Pictures", isDirectory: true)
+    let root = Folder(id: .init(), name: "Pictures", path: url.path, url: url)
+    let children = ["Alpha", "Zulu"].map { name in
+      let child = url.appending(path: name, directoryHint: .isDirectory)
+      return MediaFolder(id: .init(url: child), name: name, path: child.path, children: nil)
+    }
+    let tree = MediaFolder(
+      id: .init(url: url), name: root.name, path: root.path, children: children)
+    let items = children.map { folder in
+      MediaItem(
+        id: .init(url: folder.id.url.appending(path: "photo.jpg")), name: "photo.jpg",
+        kind: .picture, dateAdded: nil, fileSize: nil, modificationDate: nil,
+        relativePath: "\(folder.name)/photo.jpg")
+    }
+    let repository = MutableTestMediaRepository(
+      snapshot: MediaBrowserSnapshot(folderTree: tree, selectedFolder: nil, mediaItems: items))
+    let model = MediaBrowserFeatureModel(
+      folder: root, mediaRepository: repository, peopleRepository: TestPeopleRepository(),
+      fileOperations: TestFileOperationRepository(), folderAccess: TestMediaFolderAccessRepository()
+    )
+    await model.run()
+    await model.selectDestination(.folder(children[0].id))
+    model.selectMedia(items[0])
+    let selection = Set(children.map { MediaBrowserDestination.folder($0.id) })
+    await model.selectSidebarDestinations(selection)
+    #expect(model.sidebarSelection == selection)
+    #expect(model.selectedFolder == nil)
+    #expect(model.selectedMediaID == nil)
+    #expect(model.mediaSections.map(\.title) == ["Alpha", "Zulu"])
+    #expect(model.mediaItems == items)
+    for child in children { await model.loadFileOperationCapabilities(for: .folder(child)) }
+    #expect(model.canMergeSelectedFolders)
+    await model.activateMedia(items[0])
+    await model.navigate(.next)
+    #expect(model.openedMedia?.item.id == items[1].id)
+    await model.selectSidebarDestinations(selection.union([.recents]))
+    #expect(model.sidebarSelection == [.recents])
+    #expect(model.openedMedia == nil)
+    await model.selectSidebarDestinations([.recents, .folder(children[1].id)])
+    #expect(model.sidebarSelection == [.folder(children[1].id)])
+    #expect(model.selectedFolder?.id == children[1].id)
+    await model.selectSidebarDestinations(selection.union([.recents, .duplicates, .people]))
+    #expect(model.sidebarSelection == selection)
+  }
+
   @Test(arguments: [MediaBrowserDestination.recents, .duplicates, .people, .personSearch])
   func folderDuplicatesReuseTheScanFollowFoldersAndExitForAggregates(
     destination: MediaBrowserDestination
@@ -172,7 +244,7 @@ struct MediaBrowserFeatureModelTests {
         dateAdded: nil, fileSize: nil, modificationDate: nil, relativePath: path)
     }
     let first = PersonGroup(
-      id: UUID(), name: "Alice", thumbnail: MediaThumbnail(image: testMediaImage()),
+      id: UUID(), name: "Alice", thumbnail: testFaceThumbnailSource(),
       items: [items[0]])
     let split = PersonGroup(
       id: UUID(), name: "Holiday", thumbnail: first.thumbnail, items: [items[1]])
@@ -227,7 +299,7 @@ struct MediaBrowserFeatureModelTests {
     let id = UUID()
     func person(_ items: [MediaItem]) -> PersonGroup {
       PersonGroup(
-        id: id, name: "Alice", thumbnail: MediaThumbnail(image: testMediaImage()), items: items)
+        id: id, name: "Alice", thumbnail: testFaceThumbnailSource(), items: items)
     }
     let (stream, continuation) = AsyncThrowingStream<[PersonGroup], any Error>.makeStream()
     let (rescan, rescanContinuation) = AsyncThrowingStream<[PersonGroup], any Error>.makeStream()
@@ -349,7 +421,7 @@ struct MediaBrowserFeatureModelTests {
     }
     let (stream, continuation) = AsyncThrowingStream<[MediaItem], any Error>.makeStream()
     let (rescan, rescanContinuation) = AsyncThrowingStream<[MediaItem], any Error>.makeStream()
-    let thumbnail = MediaThumbnail(image: testMediaImage())
+    let thumbnail = testFaceThumbnailSource()
     let people = TestPeopleRepository(
       referenceFaces: [
         DetectedFace(embedding: [1, 0], thumbnail: thumbnail),
@@ -422,7 +494,7 @@ struct MediaBrowserFeatureModelTests {
     let (stream, continuation) = AsyncThrowingStream<[MediaItem], any Error>.makeStream()
     defer { continuation.finish() }
     let people = TestPeopleRepository(
-      referenceFaces: [DetectedFace(embedding: [1, 0], thumbnail: .init(image: testMediaImage()))],
+      referenceFaces: [DetectedFace(embedding: [1, 0], thumbnail: testFaceThumbnailSource())],
       searchStreams: [stream])
     let model = MediaBrowserFeatureModel(
       folder: folder,
@@ -457,7 +529,7 @@ struct MediaBrowserFeatureModelTests {
       $0.finish()
     }
     let people = TestPeopleRepository(
-      referenceFaces: [DetectedFace(embedding: [1, 0], thumbnail: .init(image: testMediaImage()))],
+      referenceFaces: [DetectedFace(embedding: [1, 0], thumbnail: testFaceThumbnailSource())],
       searchStreams: [failed, empty])
     let media = TestMediaRepository(
       snapshot: .init(folderTree: tree, selectedFolder: nil, mediaItems: []))
@@ -1711,6 +1783,19 @@ private actor MutableTestMediaRepository: MediaRepository {
       if duplicateFailure { throw MediaRepositoryError.invalidPicture }
       return snapshot
     }
+    if case .folders(let ids) = destination {
+      let sections = (currentSnapshot.folderTree.children ?? [])
+        .filter { ids.contains($0.id) }.sorted { $0.name < $1.name }.map { folder in
+          MediaSection(
+            id: .init(url: folder.id.url), title: folder.name,
+            items: currentSnapshot.mediaItems.filter {
+              $0.id.url.deletingLastPathComponent() == folder.id.url
+            })
+        }
+      return MediaBrowserSnapshot(
+        folderTree: currentSnapshot.folderTree, selectedFolder: nil, mediaItems: [],
+        sections: sections)
+    }
     if case .folder(let id) = destination {
       let selectedFolder = MediaFolder(
         id: id, name: id.url.lastPathComponent, path: id.url.path, children: nil)
@@ -1851,7 +1936,7 @@ private actor DelayedTestMediaRepository: MediaRepository {
   ) async throws -> MediaBrowserSnapshot {
     if destination != .duplicates { currentSnapshotCount += 1 }
     switch destination {
-    case .recents, .duplicates, .people, .person, .personSearch:
+    case .recents, .duplicates, .people, .person, .personSearch, .folders:
       try await Task.sleep(for: .seconds(1))
       return MediaBrowserSnapshot(folderTree: folder, selectedFolder: nil, mediaItems: [])
     case .folder:
@@ -2081,6 +2166,9 @@ private actor TestPeopleRepository: PeopleRepository {
     self.streams = streams
     self.references = referenceFaces
     self.searchStreams = searchStreams
+  }
+  func thumbnail(for source: FaceThumbnailSource) async throws -> MediaThumbnail {
+    MediaThumbnail(image: testMediaImage())
   }
   func people(in folder: Folder) async -> AsyncThrowingStream<[PersonGroup], any Error> {
     scanCount += 1

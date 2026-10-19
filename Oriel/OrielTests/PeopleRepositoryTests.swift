@@ -8,6 +8,30 @@ import UniformTypeIdentifiers
 
 struct PeopleRepositoryTests {
   @Test
+  func faceThumbnailCacheEvictsPixelsButKeepsSourcesUsable() async throws {
+    let url = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let first = testFaceThumbnailSource(at: url.appending(path: "first.png"))
+    let second = testFaceThumbnailSource(at: url.appending(path: "second.png"))
+    try writePicture(at: first.id.item.id.url)
+    try writePicture(at: second.id.item.id.url)
+    let repository = VisionFaceRecognitionRepository(thumbnailLimit: 1)
+    weak var evicted: CGImage?
+    do {
+      let crop = try await repository.thumbnail(for: first)
+      evicted = crop.image.cgImage
+      #expect(crop.image.cgImage.width == 112)
+      #expect(crop.image.cgImage.height == 112)
+    }
+    #expect(evicted != nil)
+    _ = try await repository.thumbnail(for: second)
+    #expect(evicted == nil)
+    let reloaded = try await repository.thumbnail(for: first)
+    #expect(reloaded.image.cgImage.width == 112)
+  }
+
+  @Test
   func strongIndividualReferenceIsNotDilutedByOtherPoses() throws {
     let root = folder()
     var clusters: [PersonCluster] = []
@@ -186,7 +210,12 @@ struct PeopleRepositoryTests {
     #expect(groups[0].name == "Alice")
     #expect(groups[0].items.map(\.relativePath) == ["Alice/01.png", "Holiday/02.png"])
     #expect(await faces.readCount == 2)
-    for try await update in await repository.people(in: root) { groups = update }
+    var cachedUpdates = 0
+    for try await update in await repository.people(in: root) {
+      groups = update
+      cachedUpdates += 1
+    }
+    #expect(cachedUpdates == 1)
     #expect(await faces.readCount == 2)
     try FileManager.default.removeItem(at: secondURL)
     for try await update in await repository.people(in: root) { groups = update }
@@ -209,6 +238,7 @@ struct PeopleRepositoryTests {
     #expect(groups[0].id == identity)
     #expect(groups[0].name == "Alice")
     #expect(groups[0].items.map(\.relativePath) == ["Aardvark/03.png"])
+    #expect(groups[0].thumbnail.id.item.id.url == earlier)
   }
 
   @Test
@@ -384,7 +414,7 @@ struct PeopleRepositoryTests {
   }
 
   private func face(_ embedding: [Float]) -> DetectedFace {
-    DetectedFace(embedding: embedding, thumbnail: thumbnail())
+    DetectedFace(embedding: embedding, thumbnail: testFaceThumbnailSource())
   }
 
   private func writePicture(at url: URL) throws {
@@ -399,13 +429,35 @@ private actor CountingFaceRepository: FaceRecognitionRepository {
   let face: DetectedFace
   private(set) var readCount = 0
   init(face: DetectedFace) { self.face = face }
+  func thumbnail(for source: FaceThumbnailSource) async throws -> MediaThumbnail {
+    throw MediaRepositoryError.thumbnailUnavailable
+  }
   func faces(in item: MediaItem) async throws -> [DetectedFace] {
     readCount += 1
-    return [face]
+    return [
+      DetectedFace(
+        embedding: face.embedding,
+        thumbnail: FaceThumbnailSource(
+          id: .init(item: item, faceIndex: 0), transform: face.thumbnail.transform))
+    ]
   }
 }
 
 private struct FixtureFaceRepository: FaceRecognitionRepository {
   let facesByID: [MediaItem.ID: [DetectedFace]]
+  func thumbnail(for source: FaceThumbnailSource) async throws -> MediaThumbnail {
+    throw MediaRepositoryError.thumbnailUnavailable
+  }
   func faces(in item: MediaItem) async throws -> [DetectedFace] { facesByID[item.id] ?? [] }
+}
+
+nonisolated func testFaceThumbnailSource(at url: URL = URL(fileURLWithPath: "/Pictures/face.png"))
+  -> FaceThumbnailSource
+{
+  FaceThumbnailSource(
+    id: .init(
+      item: MediaItem(
+        id: .init(url: url), name: url.lastPathComponent, kind: .picture,
+        dateAdded: nil, fileSize: nil, modificationDate: nil, relativePath: url.lastPathComponent),
+      faceIndex: 0), transform: .identity)
 }

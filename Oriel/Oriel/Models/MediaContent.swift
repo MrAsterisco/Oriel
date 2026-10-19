@@ -21,6 +21,7 @@ nonisolated enum MediaBrowserDestination: Hashable, Sendable {
   case person(PersonGroup.ID)
   case personSearch
   case folder(MediaFolder.ID)
+  case folders(Set<MediaFolder.ID>)
 }
 
 nonisolated enum MediaSortOption: CaseIterable, Hashable, Sendable {
@@ -226,4 +227,18 @@ nonisolated struct MediaBrowserSnapshot: Sendable {
 nonisolated struct DuplicateImageSample: Sendable {
   let aspectRatio: Double
   let pixels: [UInt8]
+  let blockSums: [Int]
+
+  init(aspectRatio: Double, pixels: [UInt8]) {
+    self.aspectRatio = aspectRatio
+    self.pixels = pixels
+    var sums = [Int](repeating: 0, count: 64)
+    for y in 0..<64 {
+      for x in 0..<64 {
+        let block = (y / 8) * 8 + x / 8
+        for channel in 0..<4 { sums[block] += Int(pixels[(y * 64 + x) * 4 + channel]) }
+      }
+    }
+    blockSums = sums
+  }
 }

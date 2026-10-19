@@ -18,6 +18,8 @@ Photos with multiple people appear once in each applicable album. Recognition is
 
 Unchanged picture metadata reuses cached detections, including no-face results. File changes queue a fresh scan; partial results appear while it runs. A failed scan reports an error and can be retried. Closing the window cancels its scan. Caches are in memory for the app session, and all processing is local. There are no network calls or runtime model downloads in this feature.
 
+Duplicate and People scans run at background priority. Vision requests prefer background processing, and SFace uses the CPU and Neural Engine to leave the GPU available for rendering. Incremental results are published at most four times per second, with complete results always published at the end. If the enumerated pictures and their metadata are unchanged, a completed scan is reused without repeating image analysis or face grouping. Duplicate scans check the existing pixel-agreement rules before requesting Vision feature prints, so distinct pictures can skip that inference entirely. These scheduling choices prioritize browsing responsiveness over scan completion time.
+
 ## Search by reference image
 
 **Search for person** in People opens the system image picker. `PeopleRepository.referenceFaces` temporarily accesses the selected image, detects its faces, and releases access after reading. The reference is neither copied into the root nor persisted. A single face starts searching automatically; an image with multiple faces presents accessible face buttons so the user chooses one. Images without a recognizable face and unreadable images report an error and allow another selection.
@@ -54,4 +56,12 @@ TEST_RUNNER_ORIEL_PEOPLE_CORPUS=/tmp/oriel-people-corpus xcodebuild \
 
 The preparer checks that positive and negative labels agree and that the pinned corpus contains 61 photos and 13 identities. It downloads public development fixtures only, into the requested new directory. Normal tests skip this opt-in test, and the app never downloads or bundles these photos. The benchmark writes its diagnostic report and embeddings to the test host’s temporary directory, outside the repository; Oriel’s feature does not persist embeddings.
 
+The same suite compares duplicate groups with an eager Vision baseline and writes diagnostic timings for eager, pixel-first, and unchanged scans to `oriel-scan-performance.json` in the test host’s temporary directory. Timing is not a pass/fail criterion; matching results must agree.
+
 The Core ML conversion was separately compared with the original ONNX model on three generated RGB inputs (cosine agreement above 0.9999).
+
+## Image memory
+
+Face detections and People groups retain embeddings and versioned image references with alignment transforms, not decoded face images. Visible People cards and reference-face choices load their 112 × 112 crops through the feature model and repositories, releasing their view state on disappearance. Recognition keeps a separate cache of at most 128 decoded crops (6.125 MiB of pixel data); eviction regenerates a crop from its source without rerunning recognition. A rescan refreshes a group's representative image from a surviving photo while preserving its name and identity.
+
+The media repository uses a separate decoded-image cache capped at 64 MiB and 256 entries. Oversized viewer images are displayed without entering that cache. Mac collection cells release their hosted images when they leave display or enter reuse, and thumbnail updates visit only visible section headers.

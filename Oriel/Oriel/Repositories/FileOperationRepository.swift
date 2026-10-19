@@ -28,6 +28,7 @@ nonisolated protocol FileOperationRepository: Sendable {
     to destinationURL: URL,
     in rootFolder: Folder
   ) async throws -> URL
+  func merge(_ folders: [MediaFolder], in rootFolder: Folder) async throws
   func createFolder(named name: String, in folder: MediaFolder, rootFolder: Folder) async throws
   func cropPicture(
     _ item: MediaItem,
@@ -57,6 +58,10 @@ nonisolated protocol FileOperationRepository: Sendable {
 }
 
 extension FileOperationRepository {
+  func merge(_ folders: [MediaFolder], in rootFolder: Folder) async throws {
+    throw FileOperationRepositoryError.unsupportedOperation("Merging folders isn’t available here.")
+  }
+
   func imageQuality(for item: MediaItem, in rootFolder: Folder) async throws
     -> DuplicateImageQuality
   {
@@ -233,49 +238,124 @@ actor LocalFileOperationRepository: FileOperationRepository {
     in rootFolder: Folder
   ) async throws -> URL {
     return try await Self.performFileIO {
-      let sourceURL = try Self.validatedMutableURL(for: target, in: rootFolder)
-      let sourceValues = try sourceURL.resourceValues(
+      try Self.moveItem(target.url, to: destinationURL, in: rootFolder)
+    }
+  }
+
+  nonisolated private static func moveItem(
+    _ source: URL, to destinationURL: URL, in rootFolder: Folder
+  ) throws -> URL {
+    let sourceURL = source.standardizedFileURL
+    guard Self.contains(sourceURL, in: rootFolder.url),
+      sourceURL != rootFolder.url.standardizedFileURL,
+      FileManager.default.isWritableFile(atPath: sourceURL.deletingLastPathComponent().path)
+    else {
+      throw FileOperationRepositoryError.invalidTarget
+    }
+    let sourceValues = try sourceURL.resourceValues(
+      forKeys: [.fileSizeKey, .isDirectoryKey, .isRegularFileKey]
+    )
+    let destinationFolderURL = try Self.validatedDestination(destinationURL, in: nil)
+    if sourceURL.deletingLastPathComponent().standardizedFileURL
+      == destinationFolderURL.standardizedFileURL
+    {
+      return sourceURL
+    }
+
+    let resultURL = destinationFolderURL.appending(
+      path: sourceURL.lastPathComponent,
+      directoryHint: sourceValues.isDirectory == true ? .isDirectory : .notDirectory
+    )
+    try Self.requireAvailable(resultURL)
+
+    var didCopy = false
+    var didBeginRemovingSource = false
+    do {
+      try FileManager.default.copyItem(at: sourceURL, to: resultURL)
+      didCopy = true
+      let resultValues = try resultURL.resourceValues(
         forKeys: [.fileSizeKey, .isDirectoryKey, .isRegularFileKey]
       )
-      let destinationFolderURL = try Self.validatedDestination(destinationURL, in: nil)
-      if sourceURL.deletingLastPathComponent().standardizedFileURL
-        == destinationFolderURL.standardizedFileURL
-      {
-        return sourceURL
-      }
-
-      let resultURL = destinationFolderURL.appending(
-        path: sourceURL.lastPathComponent,
-        directoryHint: target.isFolder ? .isDirectory : .notDirectory
-      )
-      try Self.requireAvailable(resultURL)
-
-      var didCopy = false
-      do {
-        try FileManager.default.copyItem(at: sourceURL, to: resultURL)
-        didCopy = true
-        let resultValues = try resultURL.resourceValues(
-          forKeys: [.fileSizeKey, .isDirectoryKey, .isRegularFileKey]
+      guard
+        resultValues.isDirectory == sourceValues.isDirectory,
+        resultValues.isRegularFile == sourceValues.isRegularFile,
+        sourceValues.isDirectory == true
+          || sourceValues.fileSize.map({ resultValues.fileSize == $0 }) ?? true
+      else {
+        throw FileOperationRepositoryError.unsupportedOperation(
+          "The copied item couldn’t be verified."
         )
-        guard
-          resultValues.isDirectory == sourceValues.isDirectory,
-          resultValues.isRegularFile == sourceValues.isRegularFile,
-          sourceValues.isDirectory == true
-            || sourceValues.fileSize.map({ resultValues.fileSize == $0 }) ?? true
-        else {
-          throw FileOperationRepositoryError.unsupportedOperation(
-            "The copied item couldn’t be verified."
-          )
-        }
-        try Task.checkCancellation()
-        try FileManager.default.removeItem(at: sourceURL)
-        return resultURL
-      } catch {
-        if didCopy, FileManager.default.fileExists(atPath: sourceURL.path) {
-          try? FileManager.default.removeItem(at: resultURL)
-        }
-        throw error
       }
+      try Task.checkCancellation()
+      didBeginRemovingSource = true
+      try FileManager.default.removeItem(at: sourceURL)
+      return resultURL
+    } catch {
+      if didCopy, !didBeginRemovingSource {
+        try? FileManager.default.removeItem(at: resultURL)
+      }
+      throw error
+    }
+  }
+
+  func merge(_ folders: [MediaFolder], in rootFolder: Folder) async throws {
+    try await Self.performFileIO {
+      guard Self.supportsTrash, folders.count > 1 else {
+        throw FileOperationRepositoryError.unsupportedOperation(
+          "Recoverable Trash is required to merge folders.")
+      }
+      let ordered = folders.sorted {
+        let order = $0.name.localizedStandardCompare($1.name)
+        return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
+      }
+      let urls = try ordered.map { folder in
+        let url = try Self.validatedMutableURL(for: .folder(folder), in: rootFolder)
+        guard
+          Self.contains(
+            url.resolvingSymlinksInPath(), in: rootFolder.url.resolvingSymlinksInPath()),
+          try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true
+        else {
+          throw FileOperationRepositoryError.invalidTarget
+        }
+        return try Self.validatedDestination(url, in: rootFolder)
+      }
+      guard Set(urls).count == urls.count,
+        !urls.contains(where: { candidate in
+          urls.contains { $0 != candidate && Self.contains(candidate, in: $0) }
+        }), let destination = urls.first
+      else { throw FileOperationRepositoryError.invalidTarget }
+      let manager = FileManager.default
+      var names = Set(
+        try manager.contentsOfDirectory(atPath: destination.path).map {
+          $0.precomposedStringWithCanonicalMapping.lowercased()
+        })
+      var sources: [URL] = []
+      for source in urls.dropFirst() {
+        for child in try manager.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+          guard
+            names.insert(child.lastPathComponent.precomposedStringWithCanonicalMapping.lowercased())
+              .inserted
+          else {
+            throw FileOperationRepositoryError.nameConflict(child.lastPathComponent)
+          }
+          try Self.requireAvailable(destination.appending(path: child.lastPathComponent))
+          sources.append(child)
+        }
+      }
+      for source in sources {
+        try Task.checkCancellation()
+        _ = try Self.moveItem(source, to: destination, in: rootFolder)
+      }
+      #if os(macOS)
+        for source in urls.dropFirst() {
+          try Task.checkCancellation()
+          guard try manager.contentsOfDirectory(atPath: source.path).isEmpty else {
+            throw FileOperationRepositoryError.unsupportedOperation(
+              "A source folder changed during the merge. Its remaining contents were kept.")
+          }
+          _ = try manager.trashItem(at: source, resultingItemURL: nil)
+        }
+      #endif
     }
   }
 
@@ -833,7 +913,12 @@ actor LocalFileOperationRepository: FileOperationRepository {
   nonisolated private static func performFileIO<Result: Sendable>(
     _ operation: @escaping @Sendable () throws -> Result
   ) async throws -> Result {
-    try await Task.detached(priority: .userInitiated, operation: operation).value
+    let task = Task.detached(priority: .userInitiated, operation: operation)
+    return try await withTaskCancellationHandler {
+      try await task.value
+    } onCancel: {
+      task.cancel()
+    }
   }
 
   nonisolated private static var supportsTrash: Bool {

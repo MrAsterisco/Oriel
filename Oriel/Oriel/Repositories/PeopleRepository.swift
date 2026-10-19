@@ -2,6 +2,7 @@ import Accelerate
 import Foundation
 
 nonisolated protocol PeopleRepository: Sendable {
+  func thumbnail(for source: FaceThumbnailSource) async throws -> MediaThumbnail
   func people(in folder: Folder) async -> AsyncThrowingStream<[PersonGroup], any Error>
   func referenceFaces(at url: URL) async throws -> [DetectedFace]
   func pictures(matching face: DetectedFace, in folder: Folder) async
@@ -13,6 +14,7 @@ actor LocalPeopleRepository: PeopleRepository {
   private let faces: any FaceRecognitionRepository
   private var cachedFaces: [MediaItem: [DetectedFace]] = [:]
   private var knownPeople: [Folder.ID: [PersonCluster]] = [:]
+  private var scannedPictures: [Folder.ID: [MediaItem]] = [:]
   // Moderate matches need independent references; a confident reference can establish a new pose.
   private static let matchingSimilarity: Float = 0.363
   private static let confidentSimilarity: Float = 0.6
@@ -22,12 +24,22 @@ actor LocalPeopleRepository: PeopleRepository {
     self.faces = faces
   }
 
+  func thumbnail(for source: FaceThumbnailSource) async throws -> MediaThumbnail {
+    try await faces.thumbnail(for: source)
+  }
+
   func people(in folder: Folder) -> AsyncThrowingStream<[PersonGroup], any Error> {
     AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-      let task = Task(priority: .utility) {
+      let task = Task(priority: .background) {
         do {
           let pictures = try await media.recentMedia(in: folder)
             .filter { $0.kind == .picture }.sorted { $0.relativePath < $1.relativePath }
+          try Task.checkCancellation()
+          if scannedPictures[folder.id] == pictures, let clusters = knownPeople[folder.id] {
+            continuation.yield(clusters.map(\.group))
+            continuation.finish()
+            return
+          }
           let currentItems = Set(pictures)
           cachedFaces = cachedFaces.filter {
             !$0.key.id.url.pathComponents.starts(with: folder.url.pathComponents)
@@ -40,18 +52,21 @@ actor LocalPeopleRepository: PeopleRepository {
                 mergedGroupIDs: $0.group.mergedGroupIDs), references: $0.references)
           }
           continuation.yield([])
+          var nextUpdate = ContinuousClock.now
           for item in pictures {
             try Task.checkCancellation()
             let detected = try await detectedFaces(in: item)
             try Self.add(detected, in: item, root: folder, to: &clusters)
-            if !detected.isEmpty {
+            if !detected.isEmpty, ContinuousClock.now >= nextUpdate {
               continuation.yield(clusters.map(\.group).filter { !$0.items.isEmpty })
+              nextUpdate = ContinuousClock.now.advanced(by: .milliseconds(250))
             }
           }
           try Task.checkCancellation()
           clusters.removeAll { $0.group.items.isEmpty }
           try Self.mergeSplitGroups(&clusters)
           knownPeople[folder.id] = clusters
+          scannedPictures[folder.id] = pictures
           continuation.yield(clusters.map(\.group))
           continuation.finish()
         } catch { continuation.finish(throwing: error) }
@@ -63,9 +78,11 @@ actor LocalPeopleRepository: PeopleRepository {
   func referenceFaces(at url: URL) async throws -> [DetectedFace] {
     let startedAccess = url.startAccessingSecurityScopedResource()
     defer { if startedAccess { url.stopAccessingSecurityScopedResource() } }
+    let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
     let item = MediaItem(
       id: .init(url: url), name: url.lastPathComponent, kind: .picture,
-      dateAdded: nil, fileSize: nil, modificationDate: nil, relativePath: url.lastPathComponent)
+      dateAdded: nil, fileSize: values?.fileSize.map { Int64($0) },
+      modificationDate: values?.contentModificationDate, relativePath: url.lastPathComponent)
     let detected = try await faces.faces(in: item)
     try Task.checkCancellation()
     guard !detected.isEmpty else { throw PeopleRepositoryError.noReferenceFace }
@@ -76,13 +93,14 @@ actor LocalPeopleRepository: PeopleRepository {
     -> AsyncThrowingStream<[MediaItem], any Error>
   {
     AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-      let task = Task(priority: .utility) {
+      let task = Task(priority: .background) {
         do {
           let reference = try Self.normalized(face.embedding)
           let pictures = try await media.recentMedia(in: folder)
             .filter { $0.kind == .picture }.sorted { $0.relativePath < $1.relativePath }
           var matches: [MediaItem] = []
           continuation.yield(matches)
+          var nextUpdate = ContinuousClock.now
           for item in pictures {
             try Task.checkCancellation()
             let detected = try await detectedFaces(in: item)
@@ -95,7 +113,10 @@ actor LocalPeopleRepository: PeopleRepository {
             }
             if isMatch {
               matches.append(item)
-              continuation.yield(matches)
+              if ContinuousClock.now >= nextUpdate {
+                continuation.yield(matches)
+                nextUpdate = ContinuousClock.now.advanced(by: .milliseconds(250))
+              }
             }
           }
           try Task.checkCancellation()
@@ -136,9 +157,10 @@ actor LocalPeopleRepository: PeopleRepository {
     for face in faces {
       try Task.checkCancellation()
       let embedding = try normalized(face.embedding)
+      let reference = [item.id: embedding]
       let matches = try clusters.indices.compactMap { group -> (Int, Float)? in
         guard !usedGroups.contains(group), !clusters[group].references.isEmpty else { return nil }
-        let evidence = try Self.referenceMatch([item.id: embedding], clusters[group].references)
+        let evidence = try Self.referenceMatch(reference, clusters[group].references)
         // Defer an isolated moderate pair to the ordered reconciliation pass.
         let canAssign =
           evidence.supported
@@ -146,11 +168,15 @@ actor LocalPeopleRepository: PeopleRepository {
         return canAssign ? (group, evidence.score) : nil
       }
       if let match = matches.max(by: { $0.1 < $1.1 })?.0 {
-        let previous = clusters[match].group
-        clusters[match].group = PersonGroup(
-          id: previous.id, name: previous.name, thumbnail: previous.thumbnail,
-          items: previous.items + (previous.items.contains { $0.id == item.id } ? [] : [item]),
-          mergedGroupIDs: previous.mergedGroupIDs)
+        if clusters[match].group.items.isEmpty {
+          let group = clusters[match].group
+          clusters[match].group = PersonGroup(
+            id: group.id, name: group.name, thumbnail: face.thumbnail, items: [],
+            mergedGroupIDs: group.mergedGroupIDs)
+        }
+        if !clusters[match].group.items.contains(where: { $0.id == item.id }) {
+          clusters[match].group.items.append(item)
+        }
         // A rescan updates this face's reference instead of giving the same photo extra weight.
         clusters[match].references[item.id] = embedding
         usedGroups.insert(match)

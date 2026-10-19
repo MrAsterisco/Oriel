@@ -7,6 +7,93 @@ import UniformTypeIdentifiers
 @testable import Oriel
 
 struct FileOperationRepositoryTests {
+  #if os(macOS)
+    @Test
+    func mergePreservesAllContentsAndPreflightsConflicts() async throws {
+      let manager = FileManager.default
+      let rootURL = manager.temporaryDirectory.appending(path: UUID().uuidString)
+      try manager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+      defer { try? manager.removeItem(at: rootURL) }
+      let root = Folder(id: .init(), name: "Root", path: rootURL.path, url: rootURL)
+      let folders = ["Zulu", "Alpha", "Middle"].map { name in
+        let url = rootURL.appending(path: name)
+        return MediaFolder(id: .init(url: url), name: name, path: url.path, children: nil)
+      }
+      for folder in folders {
+        try manager.createDirectory(at: folder.id.url, withIntermediateDirectories: false)
+      }
+      let repository = LocalFileOperationRepository()
+      try Data("first".utf8).write(to: folders[0].id.url.appending(path: "same.txt"))
+      try Data("second".utf8).write(to: folders[2].id.url.appending(path: "same.txt"))
+      await #expect(throws: FileOperationRepositoryError.self) {
+        try await repository.merge(folders, in: root)
+      }
+      #expect(try manager.contentsOfDirectory(atPath: folders[1].path).isEmpty)
+      #expect(manager.fileExists(atPath: folders[0].id.url.appending(path: "same.txt").path))
+      let second = folders[2].id.url.appending(path: "same.txt")
+      try manager.moveItem(at: second, to: folders[2].id.url.appending(path: "other.txt"))
+      try Data("hidden".utf8).write(to: folders[0].id.url.appending(path: ".hidden"))
+      let nested = folders[0].id.url.appending(path: "Nested")
+      try manager.createDirectory(at: nested, withIntermediateDirectories: false)
+      try Data("nested".utf8).write(to: nested.appending(path: "notes.txt"))
+      try await repository.merge(folders, in: root)
+      let destination = folders[1].id.url
+      #expect(try Data(contentsOf: destination.appending(path: "same.txt")) == Data("first".utf8))
+      #expect(try Data(contentsOf: destination.appending(path: "other.txt")) == Data("second".utf8))
+      #expect(try Data(contentsOf: destination.appending(path: ".hidden")) == Data("hidden".utf8))
+      #expect(
+        try Data(contentsOf: destination.appending(path: "Nested/notes.txt")) == Data("nested".utf8)
+      )
+      #expect(!manager.fileExists(atPath: folders[0].path))
+      #expect(!manager.fileExists(atPath: folders[2].path))
+    }
+
+    @Test
+    func cancelledMergeKeepsSourceContents() async throws {
+      let manager = FileManager.default
+      let url = manager.temporaryDirectory.appending(path: UUID().uuidString)
+      let urls = ["Alpha", "Beta"].map { url.appending(path: $0, directoryHint: .isDirectory) }
+      for child in urls {
+        try manager.createDirectory(at: child, withIntermediateDirectories: true)
+      }
+      defer { try? manager.removeItem(at: url) }
+      let original = urls[1].appending(path: "notes.txt")
+      try Data("original".utf8).write(to: original)
+      let folders = urls.map {
+        MediaFolder(id: .init(url: $0), name: $0.lastPathComponent, path: $0.path, children: nil)
+      }
+      let root = Folder(id: .init(), name: "Root", path: url.path, url: url)
+      let repository = LocalFileOperationRepository()
+      let task = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        try await repository.merge(folders, in: root)
+      }
+      await #expect(throws: CancellationError.self) { try await task.value }
+      #expect(try Data(contentsOf: original) == Data("original".utf8))
+      #expect(try manager.contentsOfDirectory(atPath: urls[0].path).isEmpty)
+    }
+
+    @Test
+    func mergeRejectsRootAndOverlappingFolders() async throws {
+      let manager = FileManager.default
+      let url = manager.temporaryDirectory.appending(path: UUID().uuidString)
+      let nested = url.appending(path: "A/Nested")
+      try manager.createDirectory(at: nested, withIntermediateDirectories: true)
+      defer { try? manager.removeItem(at: url) }
+      let root = Folder(id: .init(), name: "Root", path: url.path, url: url)
+      let folders = [url, url.appending(path: "A"), nested].map {
+        MediaFolder(id: .init(url: $0), name: $0.lastPathComponent, path: $0.path, children: nil)
+      }
+      let repository = LocalFileOperationRepository()
+      for selection in [Array(folders.prefix(2)), Array(folders.suffix(2))] {
+        await #expect(throws: FileOperationRepositoryError.self) {
+          try await repository.merge(selection, in: root)
+        }
+      }
+      #expect(manager.fileExists(atPath: nested.path))
+    }
+  #endif
+
   @Test
   func renamesDuplicatesMovesAndDeletesWithoutOverwriting() async throws {
     let fileManager = FileManager.default
